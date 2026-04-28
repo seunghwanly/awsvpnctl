@@ -6,8 +6,7 @@
   <string>com.awsvpnctl.daemon</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/bin/python3</string>
-    <string>{{PROJECT_ROOT}}/bin/awsvpnctl</string>
+    <string>{{AWSVPNCTL_BIN}}</string>
     <string>daemon</string>
     <string>--interval</string>
     <string>15</string>
@@ -22,9 +21,9 @@
   <key>ThrottleInterval</key>
   <integer>10</integer>
   <key>StandardOutPath</key>
-  <string>{{PROJECT_ROOT}}/log/daemon.log</string>
+  <string>{{LOG_DIR}}/daemon.log</string>
   <key>StandardErrorPath</key>
-  <string>{{PROJECT_ROOT}}/log/daemon.log</string>
+  <string>{{LOG_DIR}}/daemon.log</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>

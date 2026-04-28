@@ -1,7 +1,7 @@
-# aws-vpn-connector — passwordless sudo for the restricted runner only.
+# awsvpnctl — passwordless sudo for the restricted runner only.
 #
 # Installed by install.sh to /etc/sudoers.d/aws-vpn-connector.
 # The {{USER}} placeholder is substituted at install time.
 
-Defaults!{{PROJECT_ROOT}}/bin/aws-vpn-sudo-runner !requiretty
-{{USER}} ALL=(root) NOPASSWD: {{PROJECT_ROOT}}/bin/aws-vpn-sudo-runner
+Defaults!{{SUDO_RUNNER}} !requiretty
+{{USER}} ALL=(root) NOPASSWD: {{SUDO_RUNNER}}

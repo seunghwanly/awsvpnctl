@@ -15,9 +15,9 @@ awsvpnctl은 macOS에서 AWS Client VPN(SAML SSO)을 안정적으로 연결하�
 ## Quick Start
 
 ```bash
-git clone git@github.com:seunghwanly/awsvpnctl.git ~/dev/awsvpnctl
-cd ~/dev/awsvpnctl
-./install.sh
+brew tap seunghwanly/awsvpnctl https://github.com/seunghwanly/awsvpnctl.git
+brew install awsvpnctl
+awsvpnctl-install
 awsvpnctl setup
 awsvpnctl doctor
 ```
@@ -49,4 +49,4 @@ aws sso login --sso-session <name>
 - **Daemon**: LaunchAgent로 실행되는 `awsvpnctl daemon`입니다.
 - **SAML listener**: 브라우저가 POST하는 SAMLResponse를 `127.0.0.1:35001`에서 받습니다.
 
-다음 장은 [Installation](install.md)입니다.
+다음 장은 [Installation](install.md)입니다. Homebrew 설치만 필요하면 [Homebrew](homebrew.md)를 봅니다.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# aws-vpn-connector installer.
+# awsvpnctl installer.
 #
 # Default: dry-run preflight, then prompt for confirmation, then execute.
 # Flags:
@@ -9,10 +9,18 @@
 #   --no-path     skip adding bin/ to shell rc
 set -euo pipefail
 
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && /bin/pwd -P)"
+SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && /bin/pwd -P)"
+PROJECT_ROOT="${AWSVPNCTL_ROOT:-$SCRIPT_ROOT}"
 USER_NAME="$(id -un)"
 HOMEBREW_PREFIX="${HOMEBREW_PREFIX:-$(brew --prefix 2>/dev/null || echo /opt/homebrew)}"
 OPENVPN_AWS_BIN="$HOMEBREW_PREFIX/opt/openvpn-aws/sbin/openvpn"
+AWSVPNCTL_BIN="${AWSVPNCTL_BIN:-$PROJECT_ROOT/bin/awsvpnctl}"
+CONFIG_DIR="${AWSVPNCTL_CONFIG_DIR:-$PROJECT_ROOT/etc}"
+PROFILES_DIR="${AWSVPNCTL_PROFILES_DIR:-$CONFIG_DIR/profiles}"
+CONFIG_FILE="${AWSVPNCTL_CONFIG_FILE:-$CONFIG_DIR/config.json}"
+RUN_DIR="${AWSVPNCTL_RUN_DIR:-$PROJECT_ROOT/var/run}"
+LOG_DIR="${AWSVPNCTL_LOG_DIR:-$PROJECT_ROOT/log}"
+SUDO_RUNNER="${AWSVPNCTL_SUDO_RUNNER:-$PROJECT_ROOT/bin/aws-vpn-sudo-runner}"
 SUDOERS_TARGET="/etc/sudoers.d/aws-vpn-connector"
 LAUNCH_AGENT_DIR="$HOME/Library/LaunchAgents"
 LAUNCH_AGENT_TARGET="$LAUNCH_AGENT_DIR/com.awsvpnctl.daemon.plist"
@@ -20,11 +28,13 @@ LAUNCH_AGENT_LABEL="com.awsvpnctl.daemon"
 HAMMERSPOON_DIR="$HOME/.hammerspoon"
 HAMMERSPOON_TARGET="$HAMMERSPOON_DIR/awsvpnctl_hammerspoon.lua"
 
+mkdir -p "$PROFILES_DIR" "$RUN_DIR" "$LOG_DIR"
+
 # parse args
 ASSUME_YES=0
 CHECK_ONLY=0
 UNINSTALL=0
-NO_PATH=0
+NO_PATH="${AWSVPNCTL_NO_PATH:-0}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -y|--yes)    ASSUME_YES=1; shift ;;
@@ -63,7 +73,7 @@ detect_shell_rc() {
   esac
 }
 SHELL_RC="$(detect_shell_rc)"
-PATH_LINE="export PATH=\"$PROJECT_ROOT/bin:\$PATH\"  # aws-vpn-connector"
+PATH_LINE="export PATH=\"$PROJECT_ROOT/bin:\$PATH\"  # awsvpnctl"
 
 path_in_rc() {
   [[ -f "$SHELL_RC" ]] || return 1
@@ -79,7 +89,7 @@ try:
 except OSError:
     sys.exit(1)
 
-for value in re.findall(r"/[^\s\"']*aws-vpn-connector/bin", text):
+for value in re.findall(r"/[^\s\"']*(?:aws-vpn-connector|awsvpnctl)/bin", text):
     try:
         if os.path.samefile(value, target):
             sys.exit(0)
@@ -98,7 +108,7 @@ check_sudoers()  {
   check_sudo_works
 }
 check_sudo_works() {
-  sudo -n "$PROJECT_ROOT/bin/aws-vpn-sudo-runner" openvpn --version >/dev/null 2>&1
+  sudo -n "$SUDO_RUNNER" openvpn --version >/dev/null 2>&1
 }
 check_launchagent() {
   [[ -f "$LAUNCH_AGENT_TARGET" ]] && launchctl print "gui/$(id -u)/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1
@@ -117,7 +127,7 @@ except OSError:
     sys.exit(1)
 PY
 }
-count_profiles() { find "$PROJECT_ROOT/etc/profiles" -maxdepth 1 -name '*.ovpn' 2>/dev/null | wc -l | tr -d ' '; }
+count_profiles() { find "$PROFILES_DIR" -maxdepth 1 -name '*.ovpn' 2>/dev/null | wc -l | tr -d ' '; }
 discover_desktop_profiles() {
   {
     [[ -d "$HOME/Downloads" ]] && find "$HOME/Downloads" -maxdepth 4 -name '*.ovpn' 2>/dev/null
@@ -149,7 +159,7 @@ suggest_profile_name() {
 }
 
 # ── preflight: collect what is already done and what remains ────────────────
-title "aws-vpn-connector  $([[ $UNINSTALL == 1 ]] && echo "(uninstall mode)" )"
+title "awsvpnctl  $([[ $UNINSTALL == 1 ]] && echo "(uninstall mode)" )"
 
 if ! check_macos;    then die "macOS only"; fi
 if ! check_brew;     then die "Homebrew not found — install from https://brew.sh first"; fi
@@ -161,8 +171,8 @@ if check_openvpn;        then ok "patched openvpn at $OPENVPN_AWS_BIN"; OPENVPN_
 
 PROFILE_COUNT="$(count_profiles)"
 if [[ "$PROFILE_COUNT" -gt 0 ]]; then
-  ok "$PROFILE_COUNT profile(s) in etc/profiles/"
-  for p in "$PROJECT_ROOT/etc/profiles"/*.ovpn; do note "→ $(basename "$p" .ovpn)"; done
+  ok "$PROFILE_COUNT profile(s) in $PROFILES_DIR/"
+  for p in "$PROFILES_DIR"/*.ovpn; do note "→ $(basename "$p" .ovpn)"; done
   PROFILES_DONE=1
 else
   todo "no profiles in etc/profiles/"
@@ -171,19 +181,25 @@ fi
 
 # Check whether config.json's auto_connect list points at real profiles.
 config_auto_stale() {
-  local cfg="$PROJECT_ROOT/etc/config.json"
+  local cfg="$CONFIG_FILE"
   [[ -f "$cfg" ]] || return 0
   local autos
-  autos=$(/usr/bin/python3 -c "
-import json, sys
-try: cfg = json.load(open('$cfg'))
-except Exception: print('')
-print(' '.join(cfg.get('auto_connect', [])))
-" 2>/dev/null)
+  autos=$(/usr/bin/python3 - "$cfg" <<'PY' 2>/dev/null
+import json
+import sys
+
+try:
+    cfg = json.load(open(sys.argv[1]))
+except Exception:
+    print("")
+else:
+    print(" ".join(cfg.get("auto_connect", [])))
+PY
+)
   # If empty, count as stale (we will seed it)
   if [[ -z "$autos" ]]; then return 0; fi
   for n in $autos; do
-    [[ -f "$PROJECT_ROOT/etc/profiles/${n}.ovpn" ]] || return 0
+    [[ -f "$PROFILES_DIR/${n}.ovpn" ]] || return 0
   done
   return 1
 }
@@ -256,7 +272,7 @@ PENDING=0
 PLAN=()
 [[ $OPENVPN_DONE  == 0 ]] && { PLAN+=("Build & install patched openvpn (samm-git formula)"); PENDING=$((PENDING+1)); }
 [[ $PROFILES_DONE == 0 && ${#DISCOVERED[@]} -gt 0 ]] && { PLAN+=("Copy ${#DISCOVERED[@]} profile(s) into etc/profiles/"); PENDING=$((PENDING+1)); }
-[[ $CONFIG_DONE   == 0 ]] && { PLAN+=("Seed config.json auto_connect with installed profiles"); PENDING=$((PENDING+1)); }
+[[ $CONFIG_DONE   == 0 ]] && { PLAN+=("Seed $CONFIG_FILE auto_connect with installed profiles"); PENDING=$((PENDING+1)); }
 [[ $SUDOERS_DONE  == 0 ]] && { PLAN+=("Install $SUDOERS_TARGET (sudo password once)"); PENDING=$((PENDING+1)); }
 [[ $LAUNCH_DONE   == 0 ]] && { PLAN+=("Install + load LaunchAgent (auto-reconnect daemon)"); PENDING=$((PENDING+1)); }
 [[ $HS_DONE       == 0 ]] && { PLAN+=("Symlink Hammerspoon menubar"); PENDING=$((PENDING+1)); }
@@ -302,7 +318,7 @@ do_install_openvpn() {
     note "creating local tap $tap_name"
     brew tap-new --no-git "$tap_name" >/dev/null
   fi
-  install -m 0644 "$PROJECT_ROOT/share/openvpn-aws.rb" "$tap_dir/Formula/openvpn-aws.rb"
+  install -m 0644 "$PROJECT_ROOT/Formula/openvpn-aws.rb" "$tap_dir/Formula/openvpn-aws.rb"
   HOMEBREW_NO_INSTALL_FROM_API=1 brew install --build-from-source "${tap_name}/openvpn-aws"
   [[ -x "$OPENVPN_AWS_BIN" ]] || die "openvpn build failed (binary not found at $OPENVPN_AWS_BIN)"
   ok "$OPENVPN_AWS_BIN"
@@ -313,7 +329,7 @@ do_copy_profiles() {
   step "profiles" "Copying ${#DISCOVERED[@]} profile(s)"
   for i in "${!DISCOVERED[@]}"; do
     local src="${DISCOVERED[$i]}" name="${SUGGESTED_NAMES[$i]}"
-    local dst="$PROJECT_ROOT/etc/profiles/${name}.ovpn"
+    local dst="$PROFILES_DIR/${name}.ovpn"
     cp "$src" "$dst"
     chmod 600 "$dst"
     ok "${name}.ovpn"
@@ -322,12 +338,12 @@ do_copy_profiles() {
 
 do_seed_config() {
   step "config" "Seeding etc/config.json auto_connect"
-  /usr/bin/python3 - "$PROJECT_ROOT" <<'PY'
+  /usr/bin/python3 - "$CONFIG_FILE" "$PROFILES_DIR" <<'PY'
 import json, sys
 from pathlib import Path
-root = Path(sys.argv[1])
-cfg_path = root / "etc" / "config.json"
-profiles = sorted(p.stem for p in (root / "etc" / "profiles").glob("*.ovpn"))
+cfg_path = Path(sys.argv[1])
+profiles_dir = Path(sys.argv[2])
+profiles = sorted(p.stem for p in profiles_dir.glob("*.ovpn"))
 try:
     cfg = json.loads(cfg_path.read_text())
 except Exception:
@@ -337,6 +353,7 @@ cfg.setdefault("_doc", {
     "auto_connect": "Profiles auto-connected by the daemon after `aws sso login`. Edit freely.",
     "profiles": "Auto-discovered from etc/profiles/*.ovpn (basename = profile name).",
 })
+cfg_path.parent.mkdir(parents=True, exist_ok=True)
 cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")
 print(f"  set auto_connect = {profiles}")
 PY
@@ -346,7 +363,7 @@ do_install_sudoers() {
   step "sudoers" "Installing $SUDOERS_TARGET"
   local rendered; rendered="$(mktemp)"
   sed -e "s|{{USER}}|${USER_NAME}|g" \
-      -e "s|{{PROJECT_ROOT}}|${PROJECT_ROOT}|g" \
+      -e "s|{{SUDO_RUNNER}}|${SUDO_RUNNER}|g" \
       "$PROJECT_ROOT/share/sudoers.aws-vpn-connector" > "$rendered"
   sudo visudo -cf "$rendered" >/dev/null
   sudo install -m 0440 -o root -g wheel "$rendered" "$SUDOERS_TARGET"
@@ -362,7 +379,8 @@ do_install_launchagent() {
   step "launchd" "Installing LaunchAgent"
   mkdir -p "$LAUNCH_AGENT_DIR"
   local rendered; rendered="$(mktemp)"
-  sed "s|{{PROJECT_ROOT}}|${PROJECT_ROOT}|g" \
+  sed -e "s|{{AWSVPNCTL_BIN}}|${AWSVPNCTL_BIN}|g" \
+      -e "s|{{LOG_DIR}}|${LOG_DIR}|g" \
       "$PROJECT_ROOT/share/com.awsvpnctl.daemon.plist" > "$rendered"
   if launchctl print "gui/$(id -u)/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1; then
     launchctl bootout "gui/$(id -u)" "$LAUNCH_AGENT_TARGET" 2>/dev/null || true
@@ -370,7 +388,7 @@ do_install_launchagent() {
   install -m 0644 "$rendered" "$LAUNCH_AGENT_TARGET"
   rm -f "$rendered"
   launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENT_TARGET"
-  ok "loaded — logs at log/daemon.log"
+  ok "loaded — logs at $LOG_DIR/daemon.log"
 }
 
 do_install_hammerspoon() {
@@ -426,6 +444,6 @@ cat <<EOF
   Try it:
     ${C_BOLD}awsvpnctl setup${C_OFF}        # import/update .ovpn profiles and auto-connect list
     ${C_BOLD}awsvpnctl status${C_OFF}
-    ${C_BOLD}awsvpnctl connect $(ls "$PROJECT_ROOT/etc/profiles" 2>/dev/null | head -1 | sed 's/\.ovpn$//')${C_OFF}
+    ${C_BOLD}awsvpnctl connect $(ls "$PROFILES_DIR" 2>/dev/null | head -1 | sed 's/\.ovpn$//')${C_OFF}
     ${C_BOLD}aws sso login --sso-session Frontend_Developer${C_OFF}     # daemon auto-connects
 EOF

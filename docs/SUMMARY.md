@@ -2,6 +2,7 @@
 
 * [Overview](README.md)
 * [Installation](install.md)
+* [Homebrew](homebrew.md)
 * [Initial Setup](setup.md)
 * [Profiles](profiles.md)
 * [Usage](usage.md)

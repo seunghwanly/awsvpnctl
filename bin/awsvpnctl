@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-aws-vpn-connector — control CLI for AWS Client VPN with SAML SSO.
+awsvpnctl — control CLI for AWS Client VPN with SAML SSO.
 
 Subcommands:
   connect <profile>      establish VPN for profile (runs SAML flow, daemonizes openvpn)
@@ -40,12 +40,21 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-PROFILES_DIR = PROJECT_ROOT / "etc" / "profiles"
-CONFIG_FILE = PROJECT_ROOT / "etc" / "config.json"
-VAR_RUN = PROJECT_ROOT / "var" / "run"
-LOG_DIR = PROJECT_ROOT / "log"
-SUDO_RUNNER = PROJECT_ROOT / "bin" / "aws-vpn-sudo-runner"
+def _path_env(name: str, default: Path) -> Path:
+    return Path(os.environ.get(name, str(default))).expanduser()
+
+
+PROJECT_ROOT = _path_env(
+    "AWSVPNCTL_ROOT", Path(__file__).resolve().parent.parent
+).resolve()
+CONFIG_DIR = _path_env("AWSVPNCTL_CONFIG_DIR", PROJECT_ROOT / "etc")
+PROFILES_DIR = _path_env("AWSVPNCTL_PROFILES_DIR", CONFIG_DIR / "profiles")
+CONFIG_FILE = _path_env("AWSVPNCTL_CONFIG_FILE", CONFIG_DIR / "config.json")
+VAR_RUN = _path_env("AWSVPNCTL_RUN_DIR", PROJECT_ROOT / "var" / "run")
+LOG_DIR = _path_env("AWSVPNCTL_LOG_DIR", PROJECT_ROOT / "log")
+SUDO_RUNNER = _path_env(
+    "AWSVPNCTL_SUDO_RUNNER", PROJECT_ROOT / "bin" / "aws-vpn-sudo-runner"
+)
 PROFILE_ALIASES = {
     "prd": "prod",
 }

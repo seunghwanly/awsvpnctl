@@ -6,6 +6,18 @@ macOS에서 AWS Client VPN(SAML SSO)을 CLI, LaunchAgent, Hammerspoon 메뉴바�
 
 ## Quick Start
 
+Homebrew:
+
+```bash
+brew tap seunghwanly/awsvpnctl https://github.com/seunghwanly/awsvpnctl.git
+brew install awsvpnctl
+awsvpnctl-install
+awsvpnctl setup
+awsvpnctl doctor
+```
+
+Source checkout:
+
 ```bash
 git clone git@github.com:seunghwanly/awsvpnctl.git ~/dev/awsvpnctl
 cd ~/dev/awsvpnctl
@@ -39,6 +51,7 @@ aws sso login --sso-session <name>
 시작점:
 
 - [Installation](docs/install.md)
+- [Homebrew](docs/homebrew.md)
 - [Initial Setup](docs/setup.md)
 - [Profiles](docs/profiles.md)
 - [Auto Reconnect](docs/auto-reconnect.md)
@@ -51,8 +64,9 @@ awsvpnctl/
 ├── bin/                         # CLI and restricted sudo runner
 ├── docs/                        # GitBook documentation
 ├── etc/                         # local config example and profiles directory
+├── Formula/                     # Homebrew tap formulae
 ├── hammerspoon/                 # menu bar integration
-├── share/                       # LaunchAgent, sudoers, Homebrew formula templates
+├── share/                       # LaunchAgent and sudoers templates
 ├── var/run/                     # local runtime state, ignored by git
 └── log/                         # local logs, ignored by git
 ```

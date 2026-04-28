@@ -1,5 +1,5 @@
 #!/bin/bash
-# aws-vpn-sudo-runner — restricted sudo entrypoint for aws-vpn-connector.
+# aws-vpn-sudo-runner — restricted sudo entrypoint for awsvpnctl.
 #
 # Sudoers grants NOPASSWD only for THIS path. Allowed actions:
 #   openvpn <args...>           run patched openvpn binary
@@ -17,7 +17,11 @@ if [[ -x "$AWS_CLIENT_OPENVPN_BIN" ]]; then
 fi
 OPENVPN_BIN="${OPENVPN_BIN:-$DEFAULT_OPENVPN_BIN}"
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LOG_DIR="$PROJECT_ROOT/log"
+LOG_DIRS=(
+  "$PROJECT_ROOT/log"
+  "/opt/homebrew/var/log/awsvpnctl"
+  "/usr/local/var/log/awsvpnctl"
+)
 
 if [[ $# -lt 1 ]]; then
   echo "usage: $0 {openvpn|kill|cat|chown-log} [args...]" >&2
@@ -47,13 +51,16 @@ require_in_log_dir() {
     parent="$("$REALPATH_BIN" "$(dirname "$p")" 2>/dev/null || true)"
     real="${parent}/$(basename "$p")"
   fi
-  case "$real" in
-    "$LOG_DIR"/*) ;;
-    *)
-      echo "path not allowed (must live under $LOG_DIR): $p (resolved: $real)" >&2
-      exit 6
-      ;;
-  esac
+  for log_dir in "${LOG_DIRS[@]}"; do
+    local allowed
+    allowed="$("$REALPATH_BIN" "$log_dir" 2>/dev/null || true)"
+    [[ -z "$allowed" ]] && continue
+    case "$real" in
+      "$allowed"/*) return 0 ;;
+    esac
+  done
+  echo "path not allowed (must live under awsvpnctl log dir): $p (resolved: $real)" >&2
+  exit 6
 }
 
 case "$action" in

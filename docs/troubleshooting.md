@@ -10,7 +10,7 @@ awsvpnctl doctor
 
 ## openvpn Build Failed
 
-`share/openvpn-aws.rb`는 OpenVPN 2.6.12와 system `openssl@3`를 사용합니다.
+`Formula/openvpn-aws.rb`는 OpenVPN 2.6.12와 system `openssl@3`를 사용합니다.
 
 Homebrew build log:
 

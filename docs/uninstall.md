@@ -2,6 +2,14 @@
 
 ## Remove Runtime Integrations
 
+Homebrew install:
+
+```bash
+awsvpnctl-install --uninstall
+```
+
+Source checkout:
+
 ```bash
 ./install.sh --uninstall
 ```
@@ -23,6 +31,7 @@
 ## Remove OpenVPN Package
 
 ```bash
+brew uninstall awsvpnctl
 brew uninstall openvpn-aws
 ```
 

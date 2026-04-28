@@ -1,5 +1,5 @@
 -- awsvpnctl_hammerspoon.lua
--- Menubar item for aws-vpn-connector. Polls `awsvpnctl status --json` and
+-- Menubar item for awsvpnctl. Polls `awsvpnctl status --json` and
 -- exposes per-profile connect/disconnect actions in the dropdown.
 --
 -- Replaces the legacy AWS-config-watching variant: this one shows ACTUAL VPN
@@ -31,8 +31,40 @@ local function detectProjectRoot()
   return HOME .. "/dev/awsvpnctl"
 end
 
+local function detectCtl(projectRoot)
+  local candidates = {
+    "/opt/homebrew/bin/awsvpnctl",
+    "/usr/local/bin/awsvpnctl",
+    projectRoot .. "/bin/awsvpnctl",
+  }
+  for _, path in ipairs(candidates) do
+    if hs.fs.attributes(path) then
+      return path
+    end
+  end
+  return projectRoot .. "/bin/awsvpnctl"
+end
+
+local function detectDaemonLog(projectRoot)
+  local candidates = {
+    "/opt/homebrew/var/log/awsvpnctl/daemon.log",
+    "/usr/local/var/log/awsvpnctl/daemon.log",
+    projectRoot .. "/log/daemon.log",
+  }
+  for _, path in ipairs(candidates) do
+    if hs.fs.attributes(path) then
+      return path
+    end
+  end
+  return projectRoot .. "/log/daemon.log"
+end
+
+local PROJECT_ROOT = detectProjectRoot()
+
 local CONFIG = {
-  PROJECT_ROOT = detectProjectRoot(),
+  PROJECT_ROOT = PROJECT_ROOT,
+  CTL = detectCtl(PROJECT_ROOT),
+  DAEMON_LOG = detectDaemonLog(PROJECT_ROOT),
   POLL_INTERVAL = 5,        -- seconds between status polls
   ACTION_FLASH_SECONDS = 0.4,
   QUICK_PROFILES = { "dev", "prd" },
@@ -50,7 +82,7 @@ local CONFIG = {
   },
 }
 
-local CTL = CONFIG.PROJECT_ROOT .. "/bin/awsvpnctl"
+local CTL = CONFIG.CTL
 
 local function displayProfile(profile)
   return CONFIG.DISPLAY_NAMES[profile] or profile
@@ -167,7 +199,7 @@ local function setMenu(rows)
     title = "Tail daemon log",
     fn = function()
       hs.execute("/usr/bin/open -a Console " ..
-                 shellQuote(CONFIG.PROJECT_ROOT .. "/log/daemon.log"))
+                 shellQuote(CONFIG.DAEMON_LOG))
     end,
   })
   table.insert(items, {
@@ -299,7 +331,7 @@ local function initialize()
     M.menuBar:setTitle(CONFIG.ICONS.NO_CONFIG .. " VPN")
     M.menuBar:setMenu({
       { title = "awsvpnctl not installed at " .. CTL, disabled = true },
-      { title = "Run install.sh in aws-vpn-connector", disabled = true },
+      { title = "Run awsvpnctl-install or install.sh", disabled = true },
     })
     return
   end

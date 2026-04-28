@@ -45,20 +45,11 @@ class OpenvpnAws < Formula
     <<~EOS
       This installs only the AWS Client VPN-compatible OpenVPN binary.
 
-      To finish aws-vpn-connector setup, run:
-        cd /path/to/aws-vpn-connector
-        ./install.sh
+      For the awsvpnctl CLI, install:
+        brew install awsvpnctl
+        awsvpnctl-install
         awsvpnctl setup
         awsvpnctl doctor
-
-      Put your AWS Client VPN .ovpn file in ~/Downloads or pass it directly:
-        awsvpnctl setup ~/Downloads/downloaded-client-config.ovpn
-
-      Then connect manually:
-        awsvpnctl connect dev
-
-      Or use auto-reconnect after AWS SSO login:
-        aws sso login --sso-session <name>
     EOS
   end
 end

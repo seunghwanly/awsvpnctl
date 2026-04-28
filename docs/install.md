@@ -1,6 +1,20 @@
 # Installation
 
-## Clone
+## Homebrew Install
+
+권장 설치 방법입니다.
+
+```bash
+brew tap seunghwanly/awsvpnctl https://github.com/seunghwanly/awsvpnctl.git
+brew install awsvpnctl
+awsvpnctl-install
+awsvpnctl setup
+awsvpnctl doctor
+```
+
+자세한 내용은 [Homebrew](homebrew.md)를 봅니다.
+
+## Source Checkout
 
 ```bash
 git clone git@github.com:seunghwanly/awsvpnctl.git ~/dev/awsvpnctl
@@ -9,7 +23,7 @@ cd ~/dev/awsvpnctl
 
 `~/dev/awsvpnctl` 경로를 권장합니다. macOS는 `~/Documents`, `~/Desktop`, `~/Downloads`에 대해 background process 접근을 더 엄격하게 막을 수 있습니다.
 
-## Run Installer
+## Run Source Installer
 
 ```bash
 ./install.sh
