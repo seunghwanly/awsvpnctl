@@ -1265,9 +1265,12 @@ def cmd_setup(args) -> int:
 
     imported: list[str] = []
     skipped: list[str] = []
-    should_import = bool(candidates)
-    if candidates and interactive:
+    should_import = bool(candidates) and not args.skip_import
+    if candidates and interactive and not args.skip_import:
         should_import = _ask_bool("Import these .ovpn files", True)
+    if args.skip_import:
+        should_import = False
+        skipped.extend(f"{src.name} (--skip-import)" for src in candidates)
 
     if should_import:
         used_this_run: set[str] = set()
@@ -2075,6 +2078,8 @@ def main(argv=None) -> int:
                    help="auto-connect profiles: all, none, or comma-separated names")
     p.add_argument("--replace", action="store_true",
                    help="replace existing etc/profiles/<name>.ovpn when names conflict")
+    p.add_argument("--skip-import", "--no-import", action="store_true",
+                   help="show discovered .ovpn files but do not import them")
     p.add_argument("--no-discover", action="store_true",
                    help="do not scan ~/Downloads and ~/Desktop")
     p.set_defaults(func=cmd_setup)

@@ -26,6 +26,14 @@ awsvpnctl setup ~/Downloads/downloaded-client-config.ovpn
 
 자동 탐색에서 제외된 파일도 직접 지정하면 가져올 수 있습니다.
 
+탐색은 하되 import는 건너뛰기:
+
+```bash
+awsvpnctl setup --skip-import
+```
+
+`--skip-import`는 후보 `.ovpn`을 출력만 하고 `etc/profiles/`로 복사하지 않습니다. 기존 profile의 자동 연결 설정만 갱신하고 싶을 때 사용합니다. 같은 동작으로 `--no-import`도 사용할 수 있습니다.
+
 profile 이름 지정:
 
 ```bash

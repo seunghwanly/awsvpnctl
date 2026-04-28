@@ -27,6 +27,7 @@ awsvpnctl doctor
 ```
 
 `awsvpnctl setup`은 `~/Downloads`와 `~/Desktop`에서 AWS Client VPN export로 보이는 `.ovpn` 파일을 찾아 `etc/profiles/`로 가져오고, 자동 연결할 프로필을 설정합니다.
+파일 후보만 확인하고 가져오지 않으려면 `awsvpnctl setup --skip-import`를 사용합니다.
 
 ## Basic Usage
 

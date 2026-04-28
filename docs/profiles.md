@@ -29,6 +29,12 @@ awsvpnctl connect prd
 awsvpnctl setup ~/Downloads/client-vpn.ovpn --name staging
 ```
 
+후보 파일을 확인만 하고 가져오지 않으려면:
+
+```bash
+awsvpnctl setup --skip-import
+```
+
 수동:
 
 ```bash
