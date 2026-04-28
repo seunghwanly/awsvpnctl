@@ -6,7 +6,7 @@ class Awsvpnctl < Formula
       revision: "89f89bece10c7642a566f204a9b97ffc6a759bb2"
   license :cannot_represent
 
-  depends_on "openvpn-aws"
+  depends_on "seunghwanly/awsvpnctl/openvpn-aws"
   depends_on "python@3.14"
 
   def install
