@@ -111,7 +111,10 @@ check_sudo_works() {
   sudo -n "$SUDO_RUNNER" openvpn --version >/dev/null 2>&1
 }
 check_launchagent() {
-  [[ -f "$LAUNCH_AGENT_TARGET" ]] && launchctl print "gui/$(id -u)/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1
+  [[ -f "$LAUNCH_AGENT_TARGET" ]] || return 1
+  grep -qF "$AWSVPNCTL_BIN" "$LAUNCH_AGENT_TARGET" || return 1
+  grep -qF "$LOG_DIR/daemon.log" "$LAUNCH_AGENT_TARGET" || return 1
+  launchctl print "gui/$(id -u)/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1
 }
 check_hammerspoon_app() { [[ -d /Applications/Hammerspoon.app ]]; }
 check_hs_symlink() {
@@ -175,7 +178,7 @@ if [[ "$PROFILE_COUNT" -gt 0 ]]; then
   for p in "$PROFILES_DIR"/*.ovpn; do note "→ $(basename "$p" .ovpn)"; done
   PROFILES_DONE=1
 else
-  todo "no profiles in etc/profiles/"
+  todo "no profiles in $PROFILES_DIR/"
   PROFILES_DONE=0
 fi
 
@@ -271,7 +274,7 @@ fi
 PENDING=0
 PLAN=()
 [[ $OPENVPN_DONE  == 0 ]] && { PLAN+=("Build & install patched openvpn (samm-git formula)"); PENDING=$((PENDING+1)); }
-[[ $PROFILES_DONE == 0 && ${#DISCOVERED[@]} -gt 0 ]] && { PLAN+=("Copy ${#DISCOVERED[@]} profile(s) into etc/profiles/"); PENDING=$((PENDING+1)); }
+[[ $PROFILES_DONE == 0 && ${#DISCOVERED[@]} -gt 0 ]] && { PLAN+=("Copy ${#DISCOVERED[@]} profile(s) into $PROFILES_DIR/"); PENDING=$((PENDING+1)); }
 [[ $CONFIG_DONE   == 0 ]] && { PLAN+=("Seed $CONFIG_FILE auto_connect with installed profiles"); PENDING=$((PENDING+1)); }
 [[ $SUDOERS_DONE  == 0 ]] && { PLAN+=("Install $SUDOERS_TARGET (sudo password once)"); PENDING=$((PENDING+1)); }
 [[ $LAUNCH_DONE   == 0 ]] && { PLAN+=("Install + load LaunchAgent (auto-reconnect daemon)"); PENDING=$((PENDING+1)); }
