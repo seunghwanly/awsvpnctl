@@ -67,12 +67,12 @@ awsvpnctl disconnect dev
 awsvpnctl remove dev
 ```
 
-`remove`는 해당 profile을 먼저 disconnect하고, `.ovpn` 파일을 삭제한 뒤 `auto_connect` 목록에서도 제거합니다. 기본적으로 해당 profile의 runtime 파일과 log 파일도 같이 정리합니다.
+`remove`는 해당 profile을 먼저 disconnect하고, `.ovpn` 파일을 삭제한 뒤 `auto_connect` 목록에서도 제거합니다. 해당 profile의 runtime 파일도 같이 정리합니다.
 
-로그를 남기고 싶으면:
+로그까지 지우고 싶으면:
 
 ```bash
-awsvpnctl remove dev --keep-logs
+awsvpnctl remove dev --purge-logs
 ```
 
 ## Logs

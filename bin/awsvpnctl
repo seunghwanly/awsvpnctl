@@ -1517,7 +1517,7 @@ def cmd_remove(args) -> int:
         raise SystemExit(f"could not delete profile {ovpn}: {e}") from e
 
     runtime_removed = _remove_profile_runtime_files(profile)
-    log_removed = 0 if args.keep_logs else _remove_profile_logs(profile)
+    log_removed = _remove_profile_logs(profile) if args.purge_logs and not args.keep_logs else 0
 
     print(f"[{profile}] removed")
     print(f"  profile: {ovpn}")
@@ -2045,8 +2045,9 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("remove", help="disconnect and delete a configured profile")
     p.add_argument("profile")
-    p.add_argument("--keep-logs", action="store_true",
-                   help="keep log/<profile>.log files after removing the profile")
+    p.add_argument("--purge-logs", action="store_true",
+                   help="also delete log/<profile>.log files")
+    p.add_argument("--keep-logs", action="store_true", help=argparse.SUPPRESS)
     p.set_defaults(func=cmd_remove)
 
     p = sub.add_parser("status", help="show connection state")
