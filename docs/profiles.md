@@ -37,6 +37,14 @@ chmod 600 etc/profiles/staging.ovpn
 awsvpnctl list
 ```
 
+## Remove a Profile
+
+```bash
+awsvpnctl remove staging
+```
+
+이 명령은 `etc/profiles/staging.ovpn`을 삭제하고 `etc/config.json`의 `auto_connect`에서도 `staging`을 제거합니다. 연결 중이면 먼저 끊습니다.
+
 ## Auto Connect
 
 자동 연결 목록은 `etc/config.json`에 있습니다.

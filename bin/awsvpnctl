@@ -5,6 +5,7 @@ awsvpnctl — control CLI for AWS Client VPN with SAML SSO.
 Subcommands:
   connect <profile>      establish VPN for profile (runs SAML flow, daemonizes openvpn)
   disconnect <profile>   tear down VPN for profile
+  remove <profile>       disconnect and delete a configured profile
   status [--json] [-w]   show state of all profiles (-w watches and updates)
   list                   list configured profiles
   logs <profile> [-f]    tail openvpn log for profile
@@ -1442,6 +1443,93 @@ def cmd_disconnect(args) -> int:
     return 0
 
 
+def _remove_auto_connect_profile(profile: str) -> tuple[bool, list[str]]:
+    cfg = load_config()
+    raw = cfg.get("auto_connect") or []
+    remaining: list[str] = []
+    removed = False
+    for item in raw:
+        candidate = canonical_profile(str(item))
+        if candidate == profile:
+            removed = True
+            continue
+        if (PROFILES_DIR / f"{candidate}.ovpn").exists() and candidate not in remaining:
+            remaining.append(candidate)
+    if removed or remaining != raw:
+        _write_auto_connect(remaining)
+    return removed, remaining
+
+
+def _unlink_optional(path: Path, *, heal_log: bool = False) -> bool:
+    if not path.exists():
+        return False
+    if heal_log:
+        _heal_log_ownership(path)
+    try:
+        path.unlink()
+        return True
+    except OSError as e:
+        warn(f"[remove] could not delete {path}: {e}")
+        return False
+
+
+def _remove_profile_runtime_files(profile: str) -> int:
+    removed = 0
+    if VAR_RUN.exists():
+        for p in VAR_RUN.iterdir():
+            if p.name.startswith(f"{profile}.") and _unlink_optional(p):
+                removed += 1
+    return removed
+
+
+def _remove_profile_logs(profile: str) -> int:
+    removed = 0
+    if LOG_DIR.exists():
+        for p in LOG_DIR.iterdir():
+            if p.name == f"{profile}.log" or p.name.startswith(f"{profile}.log."):
+                if _unlink_optional(p, heal_log=True):
+                    removed += 1
+    return removed
+
+
+def cmd_remove(args) -> int:
+    profile = canonical_profile(args.profile)
+    ovpn = profile_path(profile)
+
+    ext = external_aws_client_status(profile)
+    if ext:
+        state = "connected" if ext["connected"] else "running"
+        warn(
+            f"[remove] {profile}: AWS VPN Client process is {state} "
+            f"(pid={ext['pid']}); disconnect it in AWS VPN Client if needed"
+        )
+
+    pid = read_pid(profile)
+    if pid and pid_alive(pid):
+        info(f"[remove] disconnecting {profile} pid={pid}")
+        stop_profile_process(profile, pid)
+
+    auto_removed, remaining_auto = _remove_auto_connect_profile(profile)
+
+    try:
+        ovpn.unlink()
+    except OSError as e:
+        raise SystemExit(f"could not delete profile {ovpn}: {e}") from e
+
+    runtime_removed = _remove_profile_runtime_files(profile)
+    log_removed = 0 if args.keep_logs else _remove_profile_logs(profile)
+
+    print(f"[{profile}] removed")
+    print(f"  profile: {ovpn}")
+    if auto_removed:
+        print(f"  auto_connect: {_format_profile_list(remaining_auto)}")
+    if runtime_removed:
+        print(f"  runtime files removed: {runtime_removed}")
+    if log_removed:
+        print(f"  log files removed: {log_removed}")
+    return 0
+
+
 def _gather_status() -> list[dict]:
     out = []
     for profile in list_profiles():
@@ -1954,6 +2042,12 @@ def main(argv=None) -> int:
     p = sub.add_parser("disconnect", help="disconnect a profile")
     p.add_argument("profile")
     p.set_defaults(func=cmd_disconnect)
+
+    p = sub.add_parser("remove", help="disconnect and delete a configured profile")
+    p.add_argument("profile")
+    p.add_argument("--keep-logs", action="store_true",
+                   help="keep log/<profile>.log files after removing the profile")
+    p.set_defaults(func=cmd_remove)
 
     p = sub.add_parser("status", help="show connection state")
     p.add_argument("--json", action="store_true")

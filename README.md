@@ -35,6 +35,7 @@ awsvpnctl list
 awsvpnctl connect dev
 awsvpnctl status
 awsvpnctl disconnect dev
+awsvpnctl remove dev
 awsvpnctl logs dev -f
 ```
 
