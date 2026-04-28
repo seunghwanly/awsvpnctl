@@ -18,10 +18,8 @@ local function detectProjectRoot()
   local candidates = {
     HOME .. "/dev/awsvpnctl",
     HOME .. "/Dev/awsvpnctl",
-    HOME .. "/Documents/awsvpnctl",
     HOME .. "/dev/aws-vpn-connector",
     HOME .. "/Dev/aws-vpn-connector",
-    HOME .. "/Documents/aws-vpn-connector",
   }
   for _, root in ipairs(candidates) do
     if hs.fs.attributes(root .. "/bin/awsvpnctl") then
