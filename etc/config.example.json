@@ -1,0 +1,7 @@
+{
+  "auto_connect": [],
+  "_doc": {
+    "auto_connect": "Profiles automatically connected by the daemon after `aws sso login` and reconnected when they drop. Empty list = manual control only.",
+    "profiles": "Profiles are auto-discovered from etc/profiles/*.ovpn -- the file basename is the profile name."
+  }
+}

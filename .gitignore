@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Local VPN profiles and generated OpenVPN configs
+etc/config.json
+!etc/config.example.json
+etc/profiles/*.ovpn
+var/run/*
+!var/run/.gitkeep
+
+# Runtime logs
+log/*
+!log/.gitkeep
+
+# Local editor/project files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Shell/script backups
+*.bak
+*.tmp

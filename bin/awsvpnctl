@@ -1,0 +1,1981 @@
+#!/usr/bin/env python3
+"""
+aws-vpn-connector — control CLI for AWS Client VPN with SAML SSO.
+
+Subcommands:
+  connect <profile>      establish VPN for profile (runs SAML flow, daemonizes openvpn)
+  disconnect <profile>   tear down VPN for profile
+  status [--json] [-w]   show state of all profiles (-w watches and updates)
+  list                   list configured profiles
+  logs <profile> [-f]    tail openvpn log for profile
+  daemon                 background watcher (auto-reconnect, SSO-trigger)
+
+State files live under <project>/var/run/<profile>.*
+Logs under <project>/log/<profile>.log
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import contextlib
+import datetime as dt
+import errno
+import fcntl
+import ipaddress
+import json
+import os
+import re
+import select
+import secrets
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROFILES_DIR = PROJECT_ROOT / "etc" / "profiles"
+CONFIG_FILE = PROJECT_ROOT / "etc" / "config.json"
+VAR_RUN = PROJECT_ROOT / "var" / "run"
+LOG_DIR = PROJECT_ROOT / "log"
+SUDO_RUNNER = PROJECT_ROOT / "bin" / "aws-vpn-sudo-runner"
+PROFILE_ALIASES = {
+    "prd": "prod",
+}
+
+AWS_CLIENT_OPENVPN_BIN = Path(
+    "/Applications/AWS VPN Client/AWS VPN Client.app/Contents/Resources/openvpn/acvc-openvpn"
+)
+HOMEBREW_OPENVPN_BIN = Path("/opt/homebrew/opt/openvpn-aws/sbin/openvpn")
+DEFAULT_OPENVPN_BIN = AWS_CLIENT_OPENVPN_BIN if AWS_CLIENT_OPENVPN_BIN.exists() else HOMEBREW_OPENVPN_BIN
+OPENVPN_BIN = os.environ.get("OPENVPN_BIN", str(DEFAULT_OPENVPN_BIN))
+SAML_LISTEN_PORT = 35001
+SAML_TIMEOUT_SEC = 180
+CONNECT_TIMEOUT_SEC = 45
+
+VAR_RUN.mkdir(parents=True, exist_ok=True)
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+class AuthRejectedError(Exception):
+    """OpenVPN reached the server, but the server rejected auth credentials."""
+
+
+# ---------------------------------------------------------------------------
+# logging helpers
+# ---------------------------------------------------------------------------
+
+def _log(level: str, msg: str) -> None:
+    ts = dt.datetime.now().strftime("%H:%M:%S")
+    sys.stderr.write(f"[{ts}] {level} {msg}\n")
+    sys.stderr.flush()
+
+
+def info(msg: str) -> None:
+    _log("INFO", msg)
+
+
+def warn(msg: str) -> None:
+    _log("WARN", msg)
+
+
+def err(msg: str) -> None:
+    _log("ERR ", msg)
+
+
+# ---------------------------------------------------------------------------
+# config
+# ---------------------------------------------------------------------------
+
+def load_config() -> dict:
+    if CONFIG_FILE.exists():
+        return json.loads(CONFIG_FILE.read_text())
+    return {"auto_connect": [], "profiles": {}}
+
+
+def list_profiles() -> list[str]:
+    return sorted(p.stem for p in PROFILES_DIR.glob("*.ovpn"))
+
+
+def canonical_profile(profile: str) -> str:
+    if (PROFILES_DIR / f"{profile}.ovpn").exists():
+        return profile
+    alias = PROFILE_ALIASES.get(profile)
+    if alias and (PROFILES_DIR / f"{alias}.ovpn").exists():
+        return alias
+    return profile
+
+
+def profile_path(profile: str) -> Path:
+    profile = canonical_profile(profile)
+    p = PROFILES_DIR / f"{profile}.ovpn"
+    if not p.exists():
+        raise SystemExit(f"profile not found: {profile} (looked at {p})")
+    return p
+
+
+# ---------------------------------------------------------------------------
+# state files
+# ---------------------------------------------------------------------------
+
+def state_path(profile: str, suffix: str) -> Path:
+    return VAR_RUN / f"{profile}.{suffix}"
+
+
+def write_state(profile: str, suffix: str, value: str) -> None:
+    state_path(profile, suffix).write_text(value)
+
+
+def read_state(profile: str, suffix: str) -> str | None:
+    p = state_path(profile, suffix)
+    if p.exists():
+        return p.read_text().strip()
+    return None
+
+
+def clear_state(profile: str) -> None:
+    for p in VAR_RUN.glob(f"{profile}.*"):
+        if p.name.endswith(".runtime.ovpn"):
+            continue
+        with contextlib.suppress(FileNotFoundError):
+            p.unlink()
+
+
+def read_pid(profile: str) -> int | None:
+    raw = read_state(profile, "pid")
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def stop_profile_process(profile: str, pid: int | None = None) -> None:
+    """Stop a profile's openvpn process if a pid is known."""
+    pid = pid or read_pid(profile)
+    if not pid or not pid_alive(pid):
+        return
+    subprocess.run(
+        ["/usr/bin/sudo", "-n", str(SUDO_RUNNER), "kill", str(pid)],
+        check=False,
+    )
+    for _ in range(20):
+        if not pid_alive(pid):
+            return
+        time.sleep(0.25)
+    subprocess.run(
+        ["/usr/bin/sudo", "-n", str(SUDO_RUNNER), "kill", "-9", str(pid)],
+        check=False,
+    )
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError as e:
+        return e.errno == errno.EPERM
+
+
+def is_connected(profile: str) -> bool:
+    pid = read_pid(profile)
+    if pid is None or not pid_alive(pid):
+        return False
+    iface = read_state(profile, "iface")
+    if not iface:
+        return False
+    return iface_up(iface)
+
+
+def external_aws_client_pid(profile: str) -> int | None:
+    """Return AWS VPN Client's own openvpn pid for this profile, if running."""
+    try:
+        out = subprocess.check_output(["/bin/ps", "-axo", "pid=,command="], text=True)
+    except subprocess.CalledProcessError:
+        return None
+    markers = []
+    for name in _external_aws_client_names(profile):
+        markers.extend([
+            f"--setenv CVPN_CONN_PROFILE_NAME {name}",
+            f"/OpenVpnConfigs/{name}",
+            f"ovpn-mgmt-{name}",
+        ])
+    for line in out.splitlines():
+        if "AWS VPN Client.app/Contents/Resources/openvpn" not in line:
+            continue
+        if any(marker in line for marker in markers):
+            try:
+                return int(line.strip().split(None, 1)[0])
+            except (ValueError, IndexError):
+                return None
+    return None
+
+
+def external_aws_client_status(profile: str) -> dict | None:
+    """Return official AWS VPN Client process/connection state for profile.
+
+    A running AWS VPN Client openvpn process is not enough to call the VPN
+    connected: the app can leave openvpn alive while it is waiting/retrying.
+    Treat it as connected only when its latest management state is CONNECTED
+    and the pushed VPN IP is still assigned to a live utun interface.
+    """
+    pid = external_aws_client_pid(profile)
+    if not pid:
+        return None
+
+    status = {
+        "pid": pid,
+        "connected": False,
+        "iface": None,
+        "endpoint": None,
+        "connected_at": None,
+    }
+    state = _external_aws_client_latest_state(profile, pid)
+    if not state or state.get("state") != "CONNECTED":
+        return status
+
+    iface = _iface_for_ip(state.get("vpn_ip") or "")
+    if not iface or not iface_up(iface):
+        return status
+
+    status.update({
+        "connected": True,
+        "iface": iface,
+        "endpoint": state.get("endpoint"),
+        "connected_at": state.get("connected_at"),
+    })
+    return status
+
+
+def _external_aws_client_latest_state(profile: str, pid: int) -> dict | None:
+    log_dir = Path.home() / ".config" / "AWSVPNClient" / "logs"
+    if not log_dir.exists():
+        return None
+    names = _external_aws_client_names(profile)
+    latest = None
+    logs = sorted(
+        log_dir.glob("ovpn_aws_vpn_client_*.log"),
+        key=lambda p: p.stat().st_mtime,
+    )[-5:]
+    for log in logs:
+        text = _tail_bytes(log, 1_000_000)
+        for line in text.splitlines():
+            if f":{pid}]" not in line or ">STATE:" not in line:
+                continue
+            if not any(f"[{name}:{pid}]" in line for name in names):
+                continue
+            fields = line.rsplit(">STATE:", 1)[1].split(",")
+            if len(fields) < 2:
+                continue
+            try:
+                connected_at = int(fields[0])
+            except ValueError:
+                connected_at = None
+            state = fields[1]
+            latest = {
+                "state": state,
+                "connected_at": connected_at if state == "CONNECTED" else None,
+                "vpn_ip": fields[3] if state == "CONNECTED" and len(fields) > 3 else None,
+                "endpoint": (
+                    f"{fields[4]}:{fields[5]}/udp"
+                    if state == "CONNECTED" and len(fields) > 5 and fields[4] and fields[5]
+                    else None
+                ),
+            }
+    return latest
+
+
+def _tail_bytes(p: Path, limit: int) -> str:
+    try:
+        with p.open("rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - limit))
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def _iface_for_ip(ip: str) -> str | None:
+    if not ip:
+        return None
+    try:
+        out = subprocess.check_output(["/sbin/ifconfig"], text=True)
+    except subprocess.CalledProcessError:
+        return None
+    cur = None
+    for line in out.splitlines():
+        m = re.match(r"^(utun\d+):", line)
+        if m:
+            cur = m.group(1)
+            continue
+        if line and not line[0].isspace():
+            cur = None
+            continue
+        if cur and re.search(rf"\binet\s+{re.escape(ip)}\b", line):
+            return cur
+    return None
+
+
+def _external_aws_client_names(profile: str) -> set[str]:
+    """Return AWS VPN Client profile names that represent our profile.
+
+    The local awsvpnctl profile can be named differently from the official app
+    profile (e.g. awsvpnctl `prod` vs AWS VPN Client `prd`), so match by CVPN
+    endpoint id when the official client config is present.
+    """
+    names = {profile}
+    try:
+        host, _port, _proto = parse_endpoint(profile_path(profile))
+    except SystemExit:
+        return names
+    m = re.search(r"(cvpn-endpoint-[a-z0-9]+)", host)
+    if not m:
+        return names
+    endpoint_id = m.group(1)
+    path = Path.home() / ".config" / "AWSVPNClient" / "ConnectionProfiles"
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return names
+    for row in data.get("ConnectionProfiles", []):
+        if row.get("CvpnEndpointId") == endpoint_id and row.get("ProfileName"):
+            names.add(str(row["ProfileName"]))
+    return names
+
+
+def iface_up(iface: str) -> bool:
+    """utun is up iff the interface exists, has an IPv4 address, and is RUNNING."""
+    try:
+        out = subprocess.check_output(["/sbin/ifconfig", iface], stderr=subprocess.DEVNULL)
+        return b"inet " in out and b"RUNNING" in out
+    except subprocess.CalledProcessError:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# .ovpn parsing & rewriting
+# ---------------------------------------------------------------------------
+
+REMOTE_RE = re.compile(r"^\s*remote\s+(\S+)\s+(\d+)\s*$", re.M)
+PROTO_RE = re.compile(r"^\s*proto\s+(\S+)\s*$", re.M)
+
+
+def parse_endpoint(ovpn: Path) -> tuple[str, int, str]:
+    text = ovpn.read_text()
+    m = REMOTE_RE.search(text)
+    if not m:
+        raise SystemExit(f"no `remote` directive in {ovpn}")
+    host, port = m.group(1), int(m.group(2))
+    pm = PROTO_RE.search(text)
+    proto = pm.group(1) if pm else "udp"
+    return host, port, proto
+
+
+# Lines we strip when building the runtime config: we feed remote/proto via cmdline
+# (so we can pin the resolved IP) and feed auth-user-pass via stdin pipe.
+_STRIP_DIRECTIVES = ("remote ", "remote-random-hostname", "proto ",
+                     "auth-federate")
+
+
+def build_runtime_conf(profile: str, ovpn: Path, keep_auth_user_pass: bool = False) -> Path:
+    out = VAR_RUN / f"{profile}.runtime.ovpn"
+    lines = []
+    for raw in ovpn.read_text().splitlines():
+        stripped = raw.strip()
+        if any(stripped.startswith(d) for d in _STRIP_DIRECTIVES):
+            continue
+        if not keep_auth_user_pass and stripped.startswith("auth-user-pass"):
+            continue
+        lines.append(raw)
+    out.write_text("\n".join(lines) + "\n")
+    out.chmod(0o600)
+    return out
+
+
+def resolve_random_host(host: str) -> str:
+    rand = secrets.token_hex(12)
+    target = f"{rand}.{host}"
+    try:
+        return socket.gethostbyname(target)
+    except socket.gaierror as e:
+        raise SystemExit(f"DNS resolve failed for {target}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# SAML phase 1: ask openvpn to elicit AUTH_FAILED with SAML challenge
+# ---------------------------------------------------------------------------
+
+def get_saml_challenge(
+    runtime_conf: Path, ip: str, port: int, proto: str
+) -> tuple[str, str, str]:
+    """Run openvpn until it returns AUTH_FAILED with SAML URL + SID.
+
+    Format observed from AWS Client VPN endpoints:
+        AUTH_FAILED,CRV1:R:<state_id>:<username_b64>:https://<idp>/...
+    """
+    creds = f"N/A\nACS::{SAML_LISTEN_PORT}\n"
+    with tempfile.NamedTemporaryFile("w", delete=False, prefix="awsvpn-creds-", suffix=".txt") as cf:
+        cf.write(creds)
+        cred_file = cf.name
+    os.chmod(cred_file, 0o600)
+    try:
+        cmd = [
+            OPENVPN_BIN,
+            "--config", str(runtime_conf),
+            "--verb", "3",
+            "--proto", proto,
+            "--remote", ip, str(port),
+            "--auth-user-pass", cred_file,
+            "--connect-retry-max", "1",
+            "--auth-retry", "none",
+        ]
+        info(f"[challenge] {' '.join(shlex.quote(c) for c in cmd)}")
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            text = proc.stdout + "\n" + proc.stderr
+        except subprocess.TimeoutExpired as e:
+            text = (e.stdout or "") + "\n" + (e.stderr or "")
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(cred_file)
+
+    challenge_line = None
+    for line in text.splitlines():
+        if "AUTH_FAILED,CRV1" in line:
+            challenge_line = line
+            break
+    if challenge_line is None:
+        tail = "\n".join(text.splitlines()[-30:])
+        raise SystemExit(f"failed to capture SAML challenge:\n{tail}")
+
+    url_m = re.search(r"https?://\S+", challenge_line)
+    if not url_m:
+        raise SystemExit(f"no SAML URL in challenge:\n{challenge_line}")
+    url = url_m.group(0)
+
+    crv1 = challenge_line.split("AUTH_FAILED,CRV1:", 1)[1]
+    fields = crv1.split(":", 3)
+    if len(fields) < 4:
+        raise SystemExit(f"unexpected CRV1 challenge format:\n{challenge_line}")
+    _flags, sid, username_b64, _challenge = fields
+    username = _decode_crv1_username(username_b64)
+    info(f"[challenge] SID={sid[:12]}… user={username!r} URL={url[:80]}…")
+    return url, sid, username
+
+
+def _decode_crv1_username(value: str) -> str:
+    """Decode CRV1 username_base64, including AWS's observed b'...' wrapper."""
+    m = re.fullmatch(r"b(['\"])(.*)\1", value)
+    if m:
+        value = m.group(2)
+    try:
+        return base64.b64decode(value).decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return "N/A"
+
+
+# ---------------------------------------------------------------------------
+# SAML phase 2: localhost listener on 35001
+# ---------------------------------------------------------------------------
+
+class _SAMLHandler(BaseHTTPRequestHandler):
+    saml_response: str | None = None
+    saml_response_encoded: str | None = None
+
+    def do_POST(self):  # noqa: N802
+        n = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(n).decode("utf-8", "replace")
+        params = urllib.parse.parse_qs(body)
+        saml = params.get("SAMLResponse", [""])[0]
+        if not saml:
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b"missing SAMLResponse\n")
+            return
+        type(self).saml_response = saml
+        type(self).saml_response_encoded = _form_value_encoded(body, "SAMLResponse")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(
+            "SAMLResponse received. You can close this window.\n".encode("utf-8")
+        )
+
+    def log_message(self, *_a, **_kw):
+        pass
+
+
+def wait_for_saml(url: str, timeout: int = SAML_TIMEOUT_SEC) -> str:
+    _SAMLHandler.saml_response = None
+    _SAMLHandler.saml_response_encoded = None
+    server = HTTPServer(("127.0.0.1", SAML_LISTEN_PORT), _SAMLHandler)
+    th = threading.Thread(target=server.serve_forever, daemon=True)
+    th.start()
+    info(f"[saml] listening on http://127.0.0.1:{SAML_LISTEN_PORT}")
+    open_url(url)
+    info("[saml] browser opened; complete sign-in to continue")
+    deadline = time.time() + timeout
+    try:
+        while time.time() < deadline:
+            if _SAMLHandler.saml_response:
+                # let the response flush back to browser
+                time.sleep(0.4)
+                info(
+                    f"[saml] response captured "
+                    f"(raw={len(_SAMLHandler.saml_response)} bytes, "
+                    f"form={len(_SAMLHandler.saml_response_encoded or '')} bytes)"
+                )
+                return _SAMLHandler.saml_response
+            time.sleep(0.2)
+        raise SystemExit("SAML response timeout (no POST received)")
+    finally:
+        threading.Thread(target=server.shutdown, daemon=True).start()
+        with contextlib.suppress(OSError):
+            server.server_close()
+
+
+def _form_value_encoded(body: str, key: str) -> str | None:
+    for part in body.split("&"):
+        name, sep, value = part.partition("=")
+        if sep and urllib.parse.unquote_plus(name) == key:
+            return value
+    return None
+
+
+# ---------------------------------------------------------------------------
+# SAML phase 3: connect for real (sudo)
+# ---------------------------------------------------------------------------
+
+def open_url(url: str) -> None:
+    subprocess.run(["/usr/bin/open", url], check=False)
+
+
+def connect_with_saml(
+    profile: str,
+    runtime_conf: Path,
+    ip: str,
+    port: int,
+    proto: str,
+    sid: str,
+    username: str,
+    saml_response: str,
+    auth_variant: str,
+    daemonize: bool = True,
+) -> None:
+    log_file = LOG_DIR / f"{profile}.log"
+    pid_file = state_path(profile, "pid")
+    iface_file = state_path(profile, "iface")
+
+    # Rotate the previous log. If it was created by an earlier sudo run (owned
+    # by root, pre-dating our user-touch fix), heal ownership first so we can
+    # rename it without sudo.
+    _heal_log_ownership(log_file)
+    if log_file.exists():
+        with contextlib.suppress(PermissionError, FileNotFoundError):
+            log_file.replace(LOG_DIR / f"{profile}.log.prev")
+
+    # Pre-create the log as the user so `sudo openvpn --log-append` writes
+    # into our user-owned file rather than creating a root-owned one.
+    _prepare_user_file(log_file, 0o644)
+    _prepare_user_file(pid_file, 0o644)
+
+    creds = f"{username}\nCRV1::{sid}::{saml_response}\n"
+    cred_file = VAR_RUN / f"{profile}.creds"
+    cred_file.write_text(creds)
+    cred_file.chmod(0o600)
+
+    cmd = [
+        "/usr/bin/sudo", "-n", str(SUDO_RUNNER), "openvpn",
+        "--config", str(runtime_conf),
+        "--verb", "3",
+        "--auth-nocache",
+        "--inactive", "0",
+        "--ping", "10",
+        "--ping-restart", "120",
+        "--proto", proto,
+        "--remote", ip, str(port),
+        "--auth-user-pass", str(cred_file),
+        "--auth-retry", "none",
+        "--writepid", str(pid_file),
+        "--log-append", str(log_file),
+        "--script-security", "2",
+    ]
+    if daemonize:
+        cmd.extend(["--daemon", f"openvpn-{profile}"])
+    mode = "daemon" if daemonize else "foreground-spawn"
+    info(f"[connect] {profile} → {ip}:{port}/{proto} ({auth_variant}, {mode})")
+    try:
+        if daemonize:
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                raise SystemExit(
+                    f"sudo openvpn failed (rc={proc.returncode}):\n"
+                    f"{proc.stderr or proc.stdout}"
+                )
+        else:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            time.sleep(0.2)
+            if proc.poll() is not None:
+                _stdout, stderr = proc.communicate()
+                raise SystemExit(
+                    f"sudo openvpn failed (rc={proc.returncode}):\n{stderr}"
+                )
+
+        iface, seq_complete = _wait_for_init(log_file, CONNECT_TIMEOUT_SEC, profile)
+        if not iface or not seq_complete:
+            raise SystemExit(
+                f"openvpn did not complete initialization within {CONNECT_TIMEOUT_SEC}s. "
+                f"See {log_file}"
+            )
+    except BaseException:
+        with contextlib.suppress(Exception):
+            stop_profile_process(profile)
+        clear_state(profile)
+        raise
+    finally:
+        cred_file.unlink(missing_ok=True)
+
+    iface_file.write_text(iface)
+    write_state(profile, "endpoint", f"{ip}:{port}/{proto}")
+    write_state(profile, "connected_at", str(int(time.time())))
+    info(f"[connect] {profile} up on {iface}")
+
+
+def connect_with_management(
+    profile: str,
+    runtime_conf: Path,
+    ip: str,
+    port: int,
+    proto: str,
+) -> None:
+    log_file = LOG_DIR / f"{profile}.log"
+    pid_file = state_path(profile, "pid")
+    iface_file = state_path(profile, "iface")
+
+    _heal_log_ownership(log_file)
+    if log_file.exists():
+        with contextlib.suppress(PermissionError, FileNotFoundError):
+            log_file.replace(LOG_DIR / f"{profile}.log.prev")
+    _prepare_user_file(log_file, 0o644)
+    _prepare_user_file(pid_file, 0o644)
+
+    mgmt_port = _free_tcp_port()
+    cmd = [
+        "/usr/bin/sudo", "-n", str(SUDO_RUNNER), "openvpn",
+        "--config", str(runtime_conf),
+        "--verb", "3",
+        "--auth-nocache",
+        "--inactive", "0",
+        "--ping", "10",
+        "--ping-restart", "120",
+        "--proto", proto,
+        "--remote", ip, str(port),
+        "--auth-retry", "interact",
+        "--writepid", str(pid_file),
+        "--log-append", str(log_file),
+        "--script-security", "2",
+        "--push-peer-info",
+        "--setenv", "UV_AWS_CLIENT_PLATFORM", "mac",
+        "--setenv", "UV_AWS_CLIENT_APP_VER", "5.3.4",
+        "--setenv", "UV_AWS_CLIENT_LAN_CIDRS", _local_lan_cidrs(),
+        "--setenv", "CVPN_CONN_PROFILE_NAME", profile,
+        "--management", "127.0.0.1", str(mgmt_port),
+        "--management-query-passwords",
+        "--management-hold",
+        "--management-log-cache", "200",
+    ]
+    info(f"[connect] {profile} → {ip}:{port}/{proto} (management)")
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        sock = _connect_management(mgmt_port, proc)
+        with sock:
+            _drive_management_auth(sock, profile)
+        iface, seq_complete = _wait_for_init(log_file, 8, profile)
+        if not iface or not seq_complete:
+            raise SystemExit(
+                f"openvpn did not complete initialization. See {log_file}"
+            )
+    except BaseException:
+        with contextlib.suppress(Exception):
+            stop_profile_process(profile, read_pid(profile) or proc.pid)
+        clear_state(profile)
+        raise
+
+    iface_file.write_text(iface)
+    write_state(profile, "endpoint", f"{ip}:{port}/{proto}")
+    write_state(profile, "connected_at", str(int(time.time())))
+    info(f"[connect] {profile} up on {iface}")
+
+
+def _free_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+def _local_lan_cidrs() -> str:
+    cidrs = []
+    iface = _default_iface()
+    if iface:
+        cidr = _iface_ipv4_cidr(iface)
+        if cidr:
+            cidrs.append(cidr)
+    if not cidrs:
+        cidrs.append("169.254.0.0/16")
+    return ",".join(cidrs)
+
+
+def _default_iface() -> str | None:
+    try:
+        out = subprocess.check_output(
+            ["/sbin/route", "-n", "get", "default"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    m = re.search(r"^\s*interface:\s*(\S+)", out, re.M)
+    return m.group(1) if m else None
+
+
+def _iface_ipv4_cidr(iface: str) -> str | None:
+    try:
+        out = subprocess.check_output(
+            ["/sbin/ifconfig", iface],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except subprocess.CalledProcessError:
+        return None
+    m = re.search(r"\binet\s+(\d+\.\d+\.\d+\.\d+)\s+netmask\s+0x([0-9a-fA-F]+)", out)
+    if not m:
+        return None
+    ip, mask_hex = m.groups()
+    try:
+        mask = ipaddress.IPv4Address(int(mask_hex, 16))
+        network = ipaddress.IPv4Network(f"{ip}/{mask}", strict=False)
+    except ValueError:
+        return None
+    if network.is_loopback:
+        return None
+    return str(network)
+
+
+def _connect_management(port: int, proc: subprocess.Popen) -> socket.socket:
+    deadline = time.time() + 10
+    last_error: OSError | None = None
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            raise SystemExit(f"openvpn exited before management was ready (rc={proc.returncode})")
+        try:
+            sock = socket.create_connection(("127.0.0.1", port), timeout=1)
+            sock.settimeout(1)
+            return sock
+        except OSError as e:
+            last_error = e
+            time.sleep(0.2)
+    raise SystemExit(f"failed to connect to openvpn management port {port}: {last_error}")
+
+
+def _mgmt_send(sock: socket.socket, command: str) -> None:
+    sock.sendall((command + "\n").encode("utf-8"))
+
+
+def _mgmt_quote(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _drive_management_auth(sock: socket.socket, profile: str) -> None:
+    sock.settimeout(None)
+    _mgmt_send(sock, "echo on")
+    _mgmt_send(sock, "state on")
+    _mgmt_send(sock, "log on")
+    _mgmt_send(sock, "hold off")
+    _mgmt_send(sock, "hold release")
+
+    challenge: tuple[str, str, str] | None = None
+    response: str | None = None
+    sent_initial = False
+    sent_response = False
+    deadline = time.time() + SAML_TIMEOUT_SEC + CONNECT_TIMEOUT_SEC
+    buf = b""
+
+    while time.time() < deadline:
+        line, buf = _mgmt_readline(sock, buf, deadline)
+        if line is None:
+            continue
+
+        if ">PASSWORD:Need 'Auth' username/password" in line:
+            if challenge and response and not sent_response:
+                _send_crv1_response(sock, challenge, response)
+                sent_response = True
+            elif not sent_initial:
+                _mgmt_send(sock, 'username "Auth" "N/A"')
+                _mgmt_send(sock, f'password "Auth" ACS::{SAML_LISTEN_PORT}')
+                sent_initial = True
+            continue
+
+        if "AUTH_FAILED,CRV1" in line and challenge is None:
+            sid, username, url = _parse_crv1_line(line)
+            challenge = (sid, username, url)
+            info(f"[challenge] SID={sid[:12]}… user={username!r} URL={url[:80]}…")
+            saml = wait_for_saml(url)
+            response = urllib.parse.quote_plus(saml, safe="")
+            _send_crv1_response(sock, challenge, response)
+            sent_response = True
+            continue
+
+        if "AUTH_FAILED,Invalid username or password" in line and sent_response:
+            raise AuthRejectedError("SAML response was rejected by the VPN endpoint")
+
+        if "Initialization Sequence Completed" in line or ",CONNECTED,SUCCESS," in line:
+            return
+
+    raise SystemExit(f"openvpn management authentication timed out for {profile}")
+
+
+def _send_crv1_response(
+    sock: socket.socket, challenge: tuple[str, str, str], response: str
+) -> None:
+    sid, username, _url = challenge
+    info("[connect] sending SAML response to openvpn management")
+    _mgmt_send(sock, f"username \"Auth\" {_mgmt_quote(username)}")
+    _mgmt_send(sock, f"password \"Auth\" CRV1::{sid}::{response}")
+    info("[connect] SAML response sent to openvpn management")
+
+
+def _mgmt_readline(
+    sock: socket.socket, buf: bytes, deadline: float
+) -> tuple[str | None, bytes]:
+    while time.time() < deadline:
+        split_at = _linebreak_index(buf)
+        if split_at is not None:
+            raw = buf[:split_at]
+            rest = buf[split_at + 1:]
+            while rest[:1] in (b"\r", b"\n"):
+                rest = rest[1:]
+            if not raw:
+                buf = rest
+                continue
+            return raw.decode("utf-8", "replace"), rest
+        timeout = min(1.0, max(0.0, deadline - time.time()))
+        if timeout <= 0:
+            break
+        ready, _w, _x = select.select([sock], [], [], timeout)
+        if not ready:
+            return None, buf
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise SystemExit("openvpn management connection closed")
+        buf += chunk
+    return None, buf
+
+
+def _linebreak_index(buf: bytes) -> int | None:
+    positions = [i for i in (buf.find(b"\n"), buf.find(b"\r")) if i >= 0]
+    return min(positions) if positions else None
+
+
+def _parse_crv1_line(line: str) -> tuple[str, str, str]:
+    url_m = re.search(r"https?://\S+", line)
+    if not url_m:
+        raise SystemExit(f"no SAML URL in challenge:\n{line}")
+    crv1 = line.split("AUTH_FAILED,CRV1:", 1)[1]
+    fields = crv1.split(":", 3)
+    if len(fields) < 4:
+        raise SystemExit(f"unexpected CRV1 challenge format:\n{line}")
+    _flags, sid, username_b64, _challenge = fields
+    return sid, _decode_crv1_username(username_b64), url_m.group(0)
+
+
+def _wait_for_init(log_file: Path, timeout: int, profile: str) -> tuple[str | None, bool]:
+    """Poll the log file until openvpn opens a utun and reports init complete.
+
+    The log file may briefly be unreadable as a normal user if a previous run
+    created it under sudo; fall back to `sudo cat` in that case. We also
+    cross-check by inspecting which utun interfaces appeared after the connect
+    attempt began (resilient to log parsing failures).
+    """
+    pre_utuns = _list_utuns()
+    deadline = time.time() + timeout
+    iface = None
+    seq_complete = False
+    while time.time() < deadline:
+        text = _read_log(log_file)
+        if text:
+            if "AUTH_FAILED,Invalid username or password" in text:
+                raise AuthRejectedError("SAML response was rejected by the VPN endpoint")
+            m = re.search(r"(?:TUN/TAP device (utun\d+) opened|Opened utun device (utun\d+))", text)
+            if m:
+                iface = m.group(1) or m.group(2)
+            if "Initialization Sequence Completed" in text:
+                seq_complete = True
+        # Fallback: any new utun running with PtP point-to-point and inet?
+        if not iface:
+            for u in _list_utuns() - pre_utuns:
+                if iface_up(u):
+                    iface = u
+                    break
+        if iface and seq_complete:
+            return iface, True
+        # If iface is up and inet present, accept even without log confirmation
+        if iface and iface_up(iface):
+            seq_complete = True
+            return iface, True
+        time.sleep(0.5)
+    return iface, seq_complete
+
+
+def _list_utuns() -> set[str]:
+    try:
+        out = subprocess.check_output(["/sbin/ifconfig", "-l"], text=True)
+    except subprocess.CalledProcessError:
+        return set()
+    return {tok for tok in out.split() if tok.startswith("utun")}
+
+
+def _read_log(p: Path) -> str:
+    """Read tail of a log file. Falls back to the sudo runner's `cat` action
+    for files written by sudo openvpn that ended up root-owned (e.g. from
+    earlier crashed runs). Best-effort: returns "" on any failure."""
+    try:
+        return _tail(p, 200)
+    except FileNotFoundError:
+        return ""
+    except PermissionError:
+        proc = subprocess.run(
+            ["/usr/bin/sudo", "-n", str(SUDO_RUNNER), "cat", str(p)],
+            capture_output=True, text=True,
+        )
+        if proc.returncode == 0:
+            # only keep the tail to bound memory / regex cost
+            return proc.stdout[-40000:]
+        return ""
+
+
+def _heal_log_ownership(p: Path) -> None:
+    """If a log file ended up root-owned (from a sudo-openvpn run that
+    pre-dated our user-touch fix), chown it back to the user via the runner."""
+    if not p.exists():
+        return
+    try:
+        st = p.stat()
+    except OSError:
+        return
+    if st.st_uid == os.getuid():
+        return
+    subprocess.run(
+        ["/usr/bin/sudo", "-n", str(SUDO_RUNNER), "chown-log", str(p)],
+        check=False,
+    )
+
+
+def _prepare_user_file(p: Path, mode: int) -> None:
+    """Ensure a sudo-written path is writable by the current user before reuse."""
+    if p.exists():
+        try:
+            st = p.stat()
+        except OSError:
+            st = None
+        if st and st.st_uid != os.getuid():
+            with contextlib.suppress(FileNotFoundError):
+                p.unlink()
+    p.touch(mode=mode)
+    p.chmod(mode)
+
+
+def _tail(p: Path, n: int) -> str:
+    with p.open("rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        block = min(size, max(n * 200, 4096))
+        f.seek(size - block)
+        return f.read().decode("utf-8", "replace")
+
+
+# ---------------------------------------------------------------------------
+# global SAML lock
+# ---------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def saml_lock():
+    lock_path = VAR_RUN / "saml.lock"
+    f = lock_path.open("w")
+    try:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            info("[saml] another connect is running; waiting…")
+            fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(f, fcntl.LOCK_UN)
+        finally:
+            f.close()
+
+
+# ---------------------------------------------------------------------------
+# command: setup
+# ---------------------------------------------------------------------------
+
+SETUP_SEARCH_DIRS = (
+    Path.home() / "Downloads",
+    Path.home() / "Desktop",
+)
+
+
+def _sanitize_profile_name(value: str) -> str:
+    name = value.strip().lower()
+    if name.endswith(".ovpn"):
+        name = name[:-5]
+    name = re.sub(r"[^a-z0-9_.-]+", "-", name)
+    name = re.sub(r"-{2,}", "-", name).strip(".-_")
+    return name
+
+
+def _suggest_profile_name(path: Path) -> str:
+    base = path.stem.strip()
+    lower = base.lower()
+    known = {
+        "development": "dev",
+        "develop": "dev",
+        "production": "prod",
+        "prd": "prod",
+        "downloaded-client-config": "vpn",
+        "client-config": "vpn",
+    }
+    if lower in known:
+        return known[lower]
+    if lower.startswith("aws-prod-") or lower.startswith("aws-prd-"):
+        return "prod"
+    if lower.startswith("aws-dev-"):
+        return "dev"
+    if lower.startswith("aws-stg-") or lower.startswith("aws-staging-"):
+        return "stg"
+    lower = re.sub(r"^aws-", "", lower)
+    lower = re.sub(r"-[0-9a-f]{8,}$", "", lower)
+    return _sanitize_profile_name(lower) or "vpn"
+
+
+def _iter_ovpn_under(root: Path, max_depth: int = 4):
+    root = root.expanduser()
+    if not root.exists():
+        return
+    stack = [(root, 0)]
+    while stack:
+        cur, depth = stack.pop()
+        try:
+            children = list(cur.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            name = child.name
+            if child.is_dir() and depth < max_depth and name not in {".git", "var", "log"}:
+                stack.append((child, depth + 1))
+                continue
+            if child.is_file() and child.suffix == ".ovpn" and not name.endswith(".runtime.ovpn"):
+                yield child
+
+
+def _dedupe_paths(paths: list[Path]) -> list[Path]:
+    seen = set()
+    out = []
+    for path in paths:
+        try:
+            key = path.resolve()
+        except OSError:
+            key = path.expanduser()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(path)
+    return out
+
+
+def _discover_setup_candidates(inputs: list[str], include_defaults: bool) -> list[Path]:
+    paths: list[Path] = []
+    for raw in inputs:
+        p = Path(raw).expanduser()
+        if p.is_dir():
+            paths.extend(_iter_ovpn_under(p))
+        elif p.is_file() and p.suffix == ".ovpn" and not p.name.endswith(".runtime.ovpn"):
+            paths.append(p)
+        else:
+            warn(f"[setup] no .ovpn found at {p}")
+
+    if include_defaults:
+        for base in SETUP_SEARCH_DIRS:
+            paths.extend(_iter_ovpn_under(base))
+
+    filtered = []
+    for p in _dedupe_paths(paths):
+        try:
+            if _path_under(p, PROFILES_DIR) or _path_under(p, VAR_RUN):
+                continue
+        except OSError:
+            pass
+        filtered.append(p)
+    return filtered
+
+
+def _ovpn_summary(path: Path) -> str:
+    try:
+        text = path.read_text(errors="replace")
+    except OSError as e:
+        return f"unreadable: {e}"
+    m = REMOTE_RE.search(text)
+    if not m:
+        return "invalid: no remote directive"
+    proto = PROTO_RE.search(text)
+    bits = [f"{m.group(1)}:{m.group(2)}/{proto.group(1) if proto else 'udp'}"]
+    if "auth-federate" not in text:
+        bits.append("warn: no auth-federate")
+    return ", ".join(bits)
+
+
+def _same_file_content(a: Path, b: Path) -> bool:
+    try:
+        return a.read_bytes() == b.read_bytes()
+    except OSError:
+        return False
+
+
+def _ask(prompt: str, default: str | None = None) -> str:
+    suffix = f" [{default}]" if default not in (None, "") else ""
+    value = input(f"{prompt}{suffix}: ").strip()
+    if not value and default is not None:
+        return default
+    return value
+
+
+def _ask_bool(prompt: str, default: bool = True) -> bool:
+    suffix = " [Y/n]" if default else " [y/N]"
+    while True:
+        value = input(f"{prompt}{suffix} ").strip().lower()
+        if not value:
+            return default
+        if value in {"y", "yes"}:
+            return True
+        if value in {"n", "no"}:
+            return False
+        print("  answer y or n")
+
+
+def _parse_auto_connect_value(value: str) -> list[str]:
+    raw = value.strip()
+    if raw.lower() in {"all", "*"}:
+        return list_profiles()
+    if raw.lower() in {"", "none", "manual", "off", "no"}:
+        return []
+    existing = set(list_profiles())
+    result = []
+    missing = []
+    for item in re.split(r"[\s,]+", raw):
+        if not item:
+            continue
+        profile = canonical_profile(item)
+        if profile in existing:
+            if profile not in result:
+                result.append(profile)
+        else:
+            missing.append(item)
+    if missing:
+        raise ValueError(f"unknown profile(s): {', '.join(missing)}")
+    return result
+
+
+def _write_auto_connect(profiles: list[str]) -> None:
+    cfg = load_config()
+    cfg["auto_connect"] = profiles
+    cfg.setdefault("_doc", {
+        "auto_connect": "Profiles automatically connected by the daemon after `aws sso login` and reconnected when they drop. Empty list = manual control only.",
+        "profiles": "Profiles are auto-discovered from etc/profiles/*.ovpn -- the file basename is the profile name.",
+    })
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2) + "\n")
+
+
+def _format_profile_list(profiles: list[str]) -> str:
+    return ", ".join(profiles) if profiles else "none"
+
+
+def cmd_setup(args) -> int:
+    interactive = not args.yes and sys.stdin.isatty() and sys.stdout.isatty()
+    PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    print(f"\nSetup: {PROJECT_ROOT}")
+
+    candidates = _discover_setup_candidates(args.ovpn, not args.no_discover)
+    if candidates:
+        print("\nCandidate .ovpn files")
+        for i, path in enumerate(candidates, 1):
+            print(f"  {i}. {path}")
+            print(f"      -> {_suggest_profile_name(path)} ({_ovpn_summary(path)})")
+    elif not list_profiles():
+        print("\nNo .ovpn files found in ~/Downloads or ~/Desktop.")
+        print("Run again with a file path, for example:")
+        print("  awsvpnctl setup ~/Downloads/downloaded-client-config.ovpn")
+
+    imported: list[str] = []
+    skipped: list[str] = []
+    should_import = bool(candidates)
+    if candidates and interactive:
+        should_import = _ask_bool("Import these .ovpn files", True)
+
+    if should_import:
+        used_this_run: set[str] = set()
+        for idx, src in enumerate(candidates):
+            suggested = args.name[idx] if idx < len(args.name) else _suggest_profile_name(src)
+            name = _sanitize_profile_name(suggested)
+            if interactive:
+                name = _sanitize_profile_name(_ask(f"Profile name for {src.name}", name))
+            if not name:
+                skipped.append(f"{src.name} (empty profile name)")
+                continue
+            if name in used_this_run:
+                base = name
+                n = 2
+                while name in used_this_run or (PROFILES_DIR / f"{name}.ovpn").exists():
+                    name = f"{base}{n}"
+                    n += 1
+            used_this_run.add(name)
+
+            dst = PROFILES_DIR / f"{name}.ovpn"
+            replace = args.replace
+            if dst.exists():
+                if _same_file_content(src, dst):
+                    skipped.append(f"{name} (already imported)")
+                    continue
+                if interactive and not replace:
+                    replace = _ask_bool(f"{name}.ovpn already exists. Replace it", False)
+                if not replace:
+                    skipped.append(f"{name} (exists)")
+                    continue
+            shutil.copy2(src, dst)
+            dst.chmod(0o600)
+            imported.append(name)
+            print(f"  imported {src.name} -> etc/profiles/{name}.ovpn")
+
+    profiles = list_profiles()
+    if args.auto is not None:
+        try:
+            auto = _parse_auto_connect_value(args.auto)
+        except ValueError as e:
+            raise SystemExit(f"invalid --auto: {e}") from e
+    elif profiles and interactive:
+        cfg = load_config()
+        existing = [
+            canonical_profile(p)
+            for p in (cfg.get("auto_connect") or [])
+            if (PROFILES_DIR / f"{canonical_profile(p)}.ovpn").exists()
+        ]
+        default_auto = existing or profiles
+        while True:
+            answer = _ask(
+                "Auto-connect after AWS SSO login (all/none/comma list)",
+                _format_profile_list(default_auto),
+            )
+            try:
+                auto = _parse_auto_connect_value(answer)
+                break
+            except ValueError as e:
+                print(f"  {e}")
+    elif profiles and args.yes:
+        auto = profiles
+    else:
+        cfg = load_config()
+        auto = [
+            canonical_profile(p)
+            for p in (cfg.get("auto_connect") or [])
+            if (PROFILES_DIR / f"{canonical_profile(p)}.ovpn").exists()
+        ]
+
+    if profiles:
+        _write_auto_connect(auto)
+
+    print("\nConfigured profiles")
+    if profiles:
+        auto_set = set(auto)
+        for p in profiles:
+            mark = "auto" if p in auto_set else "manual"
+            aliases = sorted(k for k, v in PROFILE_ALIASES.items() if v == p)
+            alias = f", alias: {', '.join(aliases)}" if aliases else ""
+            print(f"  {p} ({mark}{alias})")
+    else:
+        print("  none")
+
+    if imported:
+        print(f"\nImported: {_format_profile_list(imported)}")
+    if skipped:
+        print(f"Skipped: {'; '.join(skipped)}")
+
+    print("\nNext")
+    print("  awsvpnctl doctor")
+    if profiles:
+        print(f"  awsvpnctl connect {profiles[0]}")
+    print("  aws sso login --sso-session <name>   # daemon auto-connects configured profiles")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# command: connect / disconnect / status / list / logs / daemon
+# ---------------------------------------------------------------------------
+
+def cmd_connect(args) -> int:
+    profile = canonical_profile(args.profile)
+    ovpn = profile_path(profile)
+
+    # Manual `connect` clears any user-disabled sentinel from a previous disconnect.
+    state_path(profile, "disabled").unlink(missing_ok=True)
+
+    if is_connected(profile):
+        print(f"[{profile}] already connected")
+        return 0
+    ext = external_aws_client_status(profile)
+    if ext:
+        if ext["connected"]:
+            raise SystemExit(
+                f"[{profile}] already connected by AWS VPN Client (pid={ext['pid']}). "
+                "Disconnect it there before using awsvpnctl."
+            )
+        raise SystemExit(
+            f"[{profile}] AWS VPN Client openvpn is running (pid={ext['pid']}) "
+            "but not connected. Quit/disconnect AWS VPN Client before using awsvpnctl."
+        )
+
+    # Clean up an orphan openvpn process that lost its tunnel (e.g. SAML expiry
+    # mid-session left the process alive but the utun gone). Otherwise we'd spawn
+    # a second openvpn for the same profile.
+    orphan_pid = read_pid(profile)
+    if orphan_pid and pid_alive(orphan_pid):
+        warn(f"[{profile}] orphan openvpn pid={orphan_pid} (no live utun) — killing")
+        stop_profile_process(profile, orphan_pid)
+    clear_state(profile)
+
+    if not Path(OPENVPN_BIN).exists():
+        raise SystemExit(
+            f"patched openvpn not found at {OPENVPN_BIN}. Run install.sh first."
+        )
+    if not SUDO_RUNNER.exists():
+        raise SystemExit(f"sudo runner not found at {SUDO_RUNNER}")
+
+    host, port, proto = parse_endpoint(ovpn)
+    runtime_conf = build_runtime_conf(profile, ovpn, keep_auth_user_pass=True)
+
+    with saml_lock():
+        ip = resolve_random_host(host)
+        info(f"[connect] {profile}: resolved {host} → {ip}")
+        try:
+            connect_with_management(profile, runtime_conf, ip, port, proto)
+        except AuthRejectedError as e:
+            raise SystemExit(f"openvpn authentication failed: {e}") from e
+
+    print(f"[{profile}] connected on {read_state(profile, 'iface')}")
+    return 0
+
+
+def cmd_disconnect(args) -> int:
+    profile = canonical_profile(args.profile)
+    # Mark this profile as user-disabled so the daemon does not immediately
+    # reconnect it. `awsvpnctl connect <profile>` clears this flag.
+    state_path(profile, "disabled").write_text("user")
+    pid = read_pid(profile)
+    if pid is None:
+        print(f"[{profile}] not running")
+        # keep the .disabled flag so daemon respects user intent
+        return 0
+    if pid_alive(pid):
+        info(f"[disconnect] {profile} pid={pid}")
+        stop_profile_process(profile, pid)
+    # preserve only the .disabled flag; clear pid/iface/etc.
+    disabled = state_path(profile, "disabled").exists()
+    clear_state(profile)
+    if disabled:
+        state_path(profile, "disabled").write_text("user")
+    print(f"[{profile}] disconnected")
+    return 0
+
+
+def _gather_status() -> list[dict]:
+    out = []
+    for profile in list_profiles():
+        pid = read_pid(profile)
+        iface = read_state(profile, "iface")
+        connected_at = read_state(profile, "connected_at")
+        endpoint = read_state(profile, "endpoint")
+        connected = is_connected(profile)
+        source = "awsvpnctl"
+        external_pid = None
+        if not connected:
+            ext = external_aws_client_status(profile)
+            if ext:
+                external_pid = ext["pid"]
+            if ext and ext["connected"]:
+                connected = True
+                pid = ext["pid"]
+                iface = ext["iface"]
+                endpoint = ext["endpoint"]
+                connected_at = ext["connected_at"]
+                source = "AWS VPN Client"
+        out.append({
+            "profile": profile,
+            "connected": connected,
+            "pid": pid,
+            "iface": iface if connected else None,
+            "endpoint": endpoint,
+            "connected_at": int(connected_at) if connected_at and connected else None,
+            "source": source if connected else None,
+            "external_pid": external_pid,
+        })
+    return out
+
+
+def cmd_status(args) -> int:
+    if args.watch:
+        try:
+            while True:
+                _print_status(args.json)
+                if args.json:
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                time.sleep(args.watch)
+        except KeyboardInterrupt:
+            return 0
+    return _print_status(args.json)
+
+
+def _print_status(as_json: bool) -> int:
+    rows = _gather_status()
+    if as_json:
+        print(json.dumps(rows))
+        return 0
+    if not rows:
+        print("(no profiles configured)")
+        return 0
+    width = max(len(r["profile"]) for r in rows)
+    for r in rows:
+        flag = "● connected" if r["connected"] else "○ down"
+        extra = ""
+        if r["connected"]:
+            if r.get("source") == "AWS VPN Client":
+                extra = f"  by=AWS VPN Client  pid={r['pid']}  iface={r['iface']}"
+            else:
+                secs = int(time.time()) - (r["connected_at"] or 0)
+                extra = f"  iface={r['iface']}  up={_fmt_dur(secs)}"
+        elif r.get("external_pid"):
+            extra = f"  AWS VPN Client pid={r['external_pid']} running"
+        print(f"  {r['profile']:<{width}}  {flag}{extra}")
+    return 0
+
+
+def _fmt_dur(secs: int) -> str:
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m"
+    return f"{secs // 3600}h{(secs % 3600) // 60}m"
+
+
+def cmd_list(args) -> int:
+    profiles = list_profiles()
+    if not profiles:
+        print(f"(no .ovpn files in {PROFILES_DIR})")
+        return 0
+    cfg = load_config()
+    auto = {canonical_profile(p) for p in cfg.get("auto_connect", [])}
+    for p in profiles:
+        mark = " (auto)" if p in auto else ""
+        aliases = sorted(k for k, v in PROFILE_ALIASES.items() if v == p)
+        if aliases:
+            mark += f" (alias: {', '.join(aliases)})"
+        print(f"  {p}{mark}")
+    return 0
+
+
+def cmd_logs(args) -> int:
+    profile = canonical_profile(args.profile)
+    log_file = LOG_DIR / f"{profile}.log"
+    if not log_file.exists():
+        print(f"(no log file for {profile})")
+        return 1
+    _heal_log_ownership(log_file)
+    if args.follow:
+        os.execvp("tail", ["tail", "-n", "100", "-F", str(log_file)])
+    else:
+        sys.stdout.write(_read_log(log_file))
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# command: reconcile
+# ---------------------------------------------------------------------------
+
+def cmd_reconcile(args) -> int:
+    """Adopt orphan openvpn processes (e.g. left over from a crashed connect)
+    by re-deriving their utun interface and writing iface state files. This
+    avoids forcing the user through another SAML round-trip."""
+    fixed = 0
+    for profile in list_profiles():
+        pid = read_pid(profile)
+        if pid is None:
+            continue
+        if not pid_alive(pid):
+            warn(f"[reconcile] {profile}: pid={pid} not alive, clearing state")
+            clear_state(profile)
+            continue
+        if read_state(profile, "iface"):
+            iface = read_state(profile, "iface")
+            if iface and iface_up(iface):
+                continue
+        # Find which utun this pid owns by inspecting the log (via sudo runner
+        # cat if the log is root-owned).
+        log_file = LOG_DIR / f"{profile}.log"
+        _heal_log_ownership(log_file)
+        iface = None
+        if log_file.exists():
+            text = _read_log(log_file)
+            m = re.search(r"TUN/TAP device (utun\d+) opened", text)
+            if m:
+                iface = m.group(1)
+        if not iface:
+            warn(f"[reconcile] {profile}: pid={pid} alive but could not determine utun")
+            continue
+        if not iface_up(iface):
+            warn(f"[reconcile] {profile}: log says {iface} but interface is down")
+            continue
+        # Try to recover endpoint from log too
+        endpoint = None
+        if log_file.exists():
+            text = _read_log(log_file)
+            em = re.search(r"\[(?:.*?)\]\s+Peer Connection Initiated with \[AF_INET\](\d+\.\d+\.\d+\.\d+):(\d+)", text)
+            if em:
+                endpoint = f"{em.group(1)}:{em.group(2)}"
+        state_path(profile, "iface").write_text(iface)
+        if endpoint:
+            write_state(profile, "endpoint", endpoint)
+        # connected_at: best guess from process start time
+        try:
+            ps = subprocess.check_output(
+                ["/bin/ps", "-o", "lstart=", "-p", str(pid)], text=True
+            ).strip()
+            # parse with strptime: "Sun Apr 27 15:49:30 2026"
+            t = dt.datetime.strptime(ps, "%a %b %d %H:%M:%S %Y")
+            write_state(profile, "connected_at", str(int(t.timestamp())))
+        except Exception:  # noqa: BLE001
+            write_state(profile, "connected_at", str(int(time.time())))
+        info(f"[reconcile] {profile}: adopted pid={pid} on {iface}")
+        fixed += 1
+
+    if fixed == 0:
+        print("nothing to reconcile")
+    else:
+        print(f"reconciled {fixed} profile(s)")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# command: doctor
+# ---------------------------------------------------------------------------
+
+_OK = "\033[32m✓\033[0m" if sys.stdout.isatty() else "[OK]"
+_FAIL = "\033[31m✗\033[0m" if sys.stdout.isatty() else "[FAIL]"
+_WARN = "\033[33m!\033[0m" if sys.stdout.isatty() else "[WARN]"
+
+
+def _doctor_check(name: str, fn) -> str:
+    """Run a check and print a row. Returns one of: 'ok', 'warn', 'fail'."""
+    try:
+        result = fn()
+    except Exception as e:  # noqa: BLE001
+        print(f"  {_FAIL} {name}")
+        print(f"      {type(e).__name__}: {e}")
+        return "fail"
+    if result is True:
+        print(f"  {_OK} {name}")
+        return "ok"
+    if result is False or result is None:
+        print(f"  {_FAIL} {name}")
+        return "fail"
+    status, detail = result if isinstance(result, tuple) else (True, result)
+    if status is True:
+        icon, kind = _OK, "ok"
+    elif status == "warn":
+        icon, kind = _WARN, "warn"
+    else:
+        icon, kind = _FAIL, "fail"
+    print(f"  {icon} {name}")
+    if detail:
+        print(f"      {detail}")
+    return kind
+
+
+def _path_under(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def cmd_doctor(args) -> int:
+    print(f"\nProject: {PROJECT_ROOT}")
+    print()
+    fails = 0
+    warns = 0
+
+    def check(name, fn):
+        nonlocal fails, warns
+        kind = _doctor_check(name, fn)
+        if kind == "fail":
+            fails += 1
+        elif kind == "warn":
+            warns += 1
+
+    def chk_openvpn():
+        if not Path(OPENVPN_BIN).exists():
+            return False, f"missing: {OPENVPN_BIN} (run install.sh)"
+        try:
+            ver = subprocess.check_output([OPENVPN_BIN, "--version"], text=True,
+                                          stderr=subprocess.STDOUT).splitlines()[0]
+        except Exception:  # noqa: BLE001
+            return False, "binary exists but failed to run"
+        return True, ver
+
+    def chk_sudoers():
+        runner = SUDO_RUNNER
+        if not runner.exists():
+            return False, f"sudo runner missing: {runner}"
+        proc = subprocess.run(
+            ["/usr/bin/sudo", "-n", str(runner), "openvpn", "--version"],
+            capture_output=True, text=True,
+        )
+        if proc.returncode == 0:
+            return True, None
+        return False, "passwordless sudo for the runner is not working — run install.sh"
+
+    def chk_launchagent():
+        label = "com.awsvpnctl.daemon"
+        proc = subprocess.run(
+            ["/bin/launchctl", "print", f"gui/{os.getuid()}/{label}"],
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            protected = [
+                Path.home() / "Documents",
+                Path.home() / "Desktop",
+                Path.home() / "Downloads",
+            ]
+            if any(_path_under(PROJECT_ROOT, p) for p in protected):
+                return (
+                    "warn",
+                    f"LaunchAgent {label} not loaded; macOS may block background "
+                    f"access to {PROJECT_ROOT}",
+                )
+            return False, f"LaunchAgent {label} not loaded"
+        # Try to extract pid
+        m = re.search(r"pid\s*=\s*(\d+)", proc.stdout)
+        if m and m.group(1) != "0":
+            return True, f"running (pid={m.group(1)})"
+        log_tail = _read_log(LOG_DIR / "daemon.log")
+        if "Operation not permitted" in log_tail and str(PROJECT_ROOT) in log_tail:
+            return (
+                "warn",
+                f"LaunchAgent loaded but blocked by macOS privacy reading {PROJECT_ROOT}",
+            )
+        return ("warn", "LaunchAgent loaded but daemon not currently running")
+
+    def chk_hammerspoon():
+        target = Path.home() / ".hammerspoon" / "awsvpnctl_hammerspoon.lua"
+        if not target.exists():
+            return ("warn", "hammerspoon symlink not found (menubar disabled)")
+        if target.is_symlink():
+            return True, f"→ {os.readlink(target)}"
+        return ("warn", "exists but is not a symlink to this repo")
+
+    def chk_profiles():
+        ps = list_profiles()
+        if not ps:
+            return False, f"no .ovpn files in {PROFILES_DIR}"
+        return True, ", ".join(ps)
+
+    def chk_auto_connect():
+        cfg = load_config()
+        autos = cfg.get("auto_connect") or []
+        existing = set(list_profiles())
+        if not autos:
+            return ("warn", "auto_connect is empty — daemon will not connect anything automatically")
+        missing = [n for n in autos if canonical_profile(n) not in existing]
+        if missing:
+            return False, f"auto_connect references missing profile(s): {', '.join(missing)}"
+        canonical = []
+        for n in autos:
+            p = canonical_profile(n)
+            label = f"{n}->{p}" if n != p else p
+            canonical.append(label)
+        return True, ", ".join(canonical)
+
+    def chk_sso():
+        cfg = Path.home() / ".aws" / "config"
+        if not cfg.exists():
+            return ("warn", f"{cfg} missing — `aws sso login` will fail")
+        sessions = re.findall(r"^\[sso-session\s+(\S+)\]", cfg.read_text(), re.M)
+        if not sessions:
+            return ("warn", "no [sso-session ...] entries in ~/.aws/config")
+        return True, f"sessions: {', '.join(sessions)}"
+
+    def chk_token():
+        if _sso_token_valid():
+            return True, "valid SSO token cached"
+        return ("warn", "no valid SSO token (run `aws sso login`)")
+
+    def chk_per_profile():
+        rows = _gather_status()
+        if not rows:
+            return ("warn", "no profiles to check")
+        auto = set(_auto_profiles())
+        lines = []
+        all_ok = True
+        for r in rows:
+            if r["connected"]:
+                if r.get("source") == "AWS VPN Client":
+                    lines.append(
+                        f"{r['profile']}: connected by AWS VPN Client "
+                        f"(pid={r['pid']}, {r['iface']})"
+                    )
+                else:
+                    up = int(time.time()) - (r["connected_at"] or 0)
+                    lines.append(f"{r['profile']}: connected ({r['iface']}, up {_fmt_dur(up)})")
+            else:
+                if r["profile"] in auto:
+                    all_ok = False
+                if r.get("external_pid"):
+                    lines.append(
+                        f"{r['profile']}: down "
+                        f"(AWS VPN Client pid={r['external_pid']} running)"
+                    )
+                elif r["profile"] not in auto:
+                    lines.append(f"{r['profile']}: down (manual)")
+                else:
+                    lines.append(f"{r['profile']}: down")
+        detail = "; ".join(lines)
+        return (True if all_ok else "warn"), detail
+
+    print("Components")
+    check("openvpn binary",        chk_openvpn)
+    check("passwordless sudo",     chk_sudoers)
+    check("auto-reconnect daemon", chk_launchagent)
+    check("hammerspoon menubar",   chk_hammerspoon)
+
+    print("\nConfig")
+    check("VPN profiles",          chk_profiles)
+    check("auto_connect list",     chk_auto_connect)
+    check("AWS SSO config",        chk_sso)
+    check("AWS SSO token",         chk_token)
+
+    print("\nLive state")
+    check("VPN connections",       chk_per_profile)
+
+    print()
+    if fails == 0 and warns == 0:
+        print(f"  {_OK} all healthy")
+        return 0
+    if fails == 0:
+        print(f"  {_WARN} {warns} warning(s) — see above")
+        return 0
+    msg = f"{fails} failure(s)"
+    if warns:
+        msg += f", {warns} warning(s)"
+    print(f"  {_FAIL} {msg} — see above")
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# daemon: react to ~/.aws/sso/cache changes; reconnect drops
+# ---------------------------------------------------------------------------
+
+def _sso_cache_dir() -> Path:
+    return Path.home() / ".aws" / "sso" / "cache"
+
+
+def _sso_latest_mtime() -> float:
+    d = _sso_cache_dir()
+    if not d.exists():
+        return 0.0
+    files = list(d.glob("*.json"))
+    return max((p.stat().st_mtime for p in files), default=0.0)
+
+
+def _sso_token_valid() -> bool:
+    """Return True if any token file in ~/.aws/sso/cache has expiresAt > now."""
+    d = _sso_cache_dir()
+    if not d.exists():
+        return False
+    now = dt.datetime.now(dt.timezone.utc)
+    for p in d.glob("*.json"):
+        try:
+            data = json.loads(p.read_text())
+        except (OSError, ValueError):
+            continue
+        exp = data.get("expiresAt")
+        if not exp:
+            continue
+        try:
+            t = dt.datetime.fromisoformat(exp.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if t > now:
+            return True
+    return False
+
+
+def _auto_profiles() -> list[str]:
+    cfg = load_config()
+    explicit = cfg.get("auto_connect")
+    if explicit is not None:
+        profiles = []
+        for p in explicit:
+            profile = canonical_profile(p)
+            if (PROFILES_DIR / f"{profile}.ovpn").exists() and profile not in profiles:
+                profiles.append(profile)
+        return profiles
+    return list_profiles()
+
+
+def _safe_connect(profile: str) -> None:
+    try:
+        cmd_connect(argparse.Namespace(profile=profile))
+    except SystemExit as e:
+        warn(f"[daemon] connect {profile} failed: {e}")
+    except Exception as e:  # noqa: BLE001
+        warn(f"[daemon] connect {profile} crashed: {e!r}")
+
+
+def cmd_daemon(args) -> int:
+    info("[daemon] started")
+    last_sso_mtime = _sso_latest_mtime()
+    last_reconnect_attempt: dict[str, float] = {}
+
+    def handle_sigterm(_sig, _frm):
+        info("[daemon] SIGTERM, exiting")
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, handle_sigterm)
+    signal.signal(signal.SIGINT, handle_sigterm)
+
+    while True:
+        try:
+            cur_mtime = _sso_latest_mtime()
+            sso_refreshed = cur_mtime > last_sso_mtime
+            if sso_refreshed:
+                info(f"[daemon] SSO cache changed (mtime={cur_mtime})")
+                last_sso_mtime = cur_mtime
+
+            sso_ok = _sso_token_valid()
+
+            for profile in _auto_profiles():
+                if is_connected(profile) or external_aws_client_pid(profile):
+                    continue
+                # User explicitly disconnected — don't fight them.
+                if state_path(profile, "disabled").exists() and not sso_refreshed:
+                    continue
+                # An SSO refresh is treated as user intent to be online: clear sentinel.
+                if sso_refreshed:
+                    state_path(profile, "disabled").unlink(missing_ok=True)
+                # backoff: don't retry within 60s of last attempt
+                if time.time() - last_reconnect_attempt.get(profile, 0) < 60:
+                    continue
+                if sso_ok or sso_refreshed:
+                    info(f"[daemon] auto-connect {profile} (sso_ok={sso_ok})")
+                    last_reconnect_attempt[profile] = time.time()
+                    _safe_connect(profile)
+        except Exception as e:  # noqa: BLE001
+            warn(f"[daemon] loop error: {e!r}")
+
+        time.sleep(args.interval)
+
+
+# ---------------------------------------------------------------------------
+# argparse
+# ---------------------------------------------------------------------------
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(prog="awsvpnctl")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("connect", help="connect a profile")
+    p.add_argument("profile")
+    p.set_defaults(func=cmd_connect)
+
+    p = sub.add_parser("disconnect", help="disconnect a profile")
+    p.add_argument("profile")
+    p.set_defaults(func=cmd_disconnect)
+
+    p = sub.add_parser("status", help="show connection state")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("-w", "--watch", type=float, default=0,
+                   help="repeat every N seconds")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("list", help="list configured profiles")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("logs", help="tail openvpn log")
+    p.add_argument("profile")
+    p.add_argument("-f", "--follow", action="store_true")
+    p.set_defaults(func=cmd_logs)
+
+    p = sub.add_parser("setup", help="import .ovpn profiles and configure auto-connect")
+    p.add_argument("ovpn", nargs="*",
+                   help=".ovpn file(s) or directories to import; defaults to scanning ~/Downloads and ~/Desktop")
+    p.add_argument("-y", "--yes", action="store_true",
+                   help="accept defaults: import discovered files and auto-connect all profiles")
+    p.add_argument("--name", action="append", default=[],
+                   help="profile name for an imported file; repeat to map multiple files")
+    p.add_argument("--auto",
+                   help="auto-connect profiles: all, none, or comma-separated names")
+    p.add_argument("--replace", action="store_true",
+                   help="replace existing etc/profiles/<name>.ovpn when names conflict")
+    p.add_argument("--no-discover", action="store_true",
+                   help="do not scan ~/Downloads and ~/Desktop")
+    p.set_defaults(func=cmd_setup)
+
+    p = sub.add_parser("daemon", help="background watcher loop")
+    p.add_argument("--interval", type=float, default=15.0)
+    p.set_defaults(func=cmd_daemon)
+
+    p = sub.add_parser("doctor", help="diagnose installation health")
+    p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser("reconcile",
+        help="adopt running openvpn processes whose iface state was lost (recover from crashes without re-doing SAML)")
+    p.set_defaults(func=cmd_reconcile)
+
+    args = parser.parse_args(argv)
+    return args.func(args) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

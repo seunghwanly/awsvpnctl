@@ -1,0 +1,92 @@
+#!/bin/bash
+# aws-vpn-sudo-runner — restricted sudo entrypoint for aws-vpn-connector.
+#
+# Sudoers grants NOPASSWD only for THIS path. Allowed actions:
+#   openvpn <args...>           run patched openvpn binary
+#   kill <signal-or-pid>...     send signals (validated args)
+#   cat <path>                  read a file inside this project's log/ dir
+#   chown-log <path>            chown a file inside log/ to the invoking user
+#
+# Anything else is rejected.
+set -euo pipefail
+
+AWS_CLIENT_OPENVPN_BIN="/Applications/AWS VPN Client/AWS VPN Client.app/Contents/Resources/openvpn/acvc-openvpn"
+DEFAULT_OPENVPN_BIN="/opt/homebrew/opt/openvpn-aws/sbin/openvpn"
+if [[ -x "$AWS_CLIENT_OPENVPN_BIN" ]]; then
+  DEFAULT_OPENVPN_BIN="$AWS_CLIENT_OPENVPN_BIN"
+fi
+OPENVPN_BIN="${OPENVPN_BIN:-$DEFAULT_OPENVPN_BIN}"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LOG_DIR="$PROJECT_ROOT/log"
+
+if [[ $# -lt 1 ]]; then
+  echo "usage: $0 {openvpn|kill|cat|chown-log} [args...]" >&2
+  exit 2
+fi
+
+action=$1
+shift
+
+# Reject any path that escapes LOG_DIR (no .., no symlink trickery).
+# realpath lives at /bin/realpath on macOS (Linux: /usr/bin/realpath).
+REALPATH_BIN=""
+for c in /bin/realpath /usr/bin/realpath; do
+  [[ -x "$c" ]] && { REALPATH_BIN="$c"; break; }
+done
+
+require_in_log_dir() {
+  local p="$1" real
+  if [[ -z "$REALPATH_BIN" ]]; then
+    echo "no realpath binary available" >&2
+    exit 8
+  fi
+  real="$("$REALPATH_BIN" "$p" 2>/dev/null || true)"
+  if [[ -z "$real" ]]; then
+    # realpath fails on missing files — accept if the parent dir is LOG_DIR
+    local parent
+    parent="$("$REALPATH_BIN" "$(dirname "$p")" 2>/dev/null || true)"
+    real="${parent}/$(basename "$p")"
+  fi
+  case "$real" in
+    "$LOG_DIR"/*) ;;
+    *)
+      echo "path not allowed (must live under $LOG_DIR): $p (resolved: $real)" >&2
+      exit 6
+      ;;
+  esac
+}
+
+case "$action" in
+  openvpn)
+    if [[ ! -x "$OPENVPN_BIN" ]]; then
+      echo "openvpn binary not executable: $OPENVPN_BIN" >&2
+      exit 3
+    fi
+    exec "$OPENVPN_BIN" "$@"
+    ;;
+  kill)
+    for arg in "$@"; do
+      if [[ ! "$arg" =~ ^([1-9][0-9]*|-([0-9]+|KILL|TERM|HUP|INT))$ ]]; then
+        echo "kill: rejected arg: $arg" >&2
+        exit 4
+      fi
+    done
+    exec /bin/kill "$@"
+    ;;
+  cat)
+    [[ $# -eq 1 ]] || { echo "cat: expected exactly one path"; exit 5; }
+    require_in_log_dir "$1"
+    exec /bin/cat "$1"
+    ;;
+  chown-log)
+    [[ $# -eq 1 ]] || { echo "chown-log: expected exactly one path"; exit 5; }
+    require_in_log_dir "$1"
+    target_user="${SUDO_USER:-${USER:-}}"
+    [[ -n "$target_user" ]] || { echo "no invoking user"; exit 7; }
+    exec /usr/sbin/chown "$target_user" "$1"
+    ;;
+  *)
+    echo "unknown action: $action" >&2
+    exit 5
+    ;;
+esac
