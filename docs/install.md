@@ -43,7 +43,7 @@ cd ~/dev/awsvpnctl
 ## What Install Does
 
 1. OpenVPN AWS SAML patch 빌드 또는 확인
-2. `.ovpn` profile 자동 탐색 및 복사
+2. AWS Client VPN export로 보이는 `.ovpn` profile 자동 탐색 및 복사
 3. `etc/config.json` 생성 또는 갱신
 4. 제한된 passwordless sudoers 설치
 5. LaunchAgent 설치 및 로드

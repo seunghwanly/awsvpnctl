@@ -135,7 +135,9 @@ discover_desktop_profiles() {
   {
     [[ -d "$HOME/Downloads" ]] && find "$HOME/Downloads" -maxdepth 4 -name '*.ovpn' 2>/dev/null
     [[ -d "$HOME/Desktop" ]] && find "$HOME/Desktop" -maxdepth 4 -name '*.ovpn' 2>/dev/null
-  } | sort -u
+  } | while IFS= read -r f; do
+    [[ -n "$(suggest_profile_name "$f")" ]] && printf '%s\n' "$f"
+  done | sort -u
 }
 
 # Map a discovered .ovpn filename to a short profile name.
@@ -144,21 +146,31 @@ discover_desktop_profiles() {
 #   aws-dev-<hex>.ovpn        -> dev
 #   development.ovpn          -> dev
 #   downloaded-client-config  -> vpn
-#   *.ovpn                    -> basename without trailing -<hex>
+# Unrecognized files are ignored during automatic discovery; pass them
+# explicitly to `awsvpnctl setup /path/to/file.ovpn` if they should be imported.
 suggest_profile_name() {
   local f base name
   f="$1"; base="$(basename "$f" .ovpn)"
   case "$base" in
     aws-prod-*)            echo "prod"; return ;;
+    aws-prd-*)             echo "prod"; return ;;
     aws-dev-*)             echo "dev";  return ;;
     aws-stg-*|aws-staging-*) echo "stg"; return ;;
     development)           echo "dev";  return ;;
     production)            echo "prod"; return ;;
     downloaded-client-config|client-config) echo "vpn"; return ;;
   esac
+  case "$base" in
+    aws-*) ;;
+    *) echo ""; return ;;
+  esac
   name="${base#aws-}"
-  name="$(echo "$name" | sed -E 's/-[0-9a-f]{16,}$//')"
-  echo "$name"
+  name="$(echo "$name" | sed -E 's/-[0-9a-f]{8,}$//')"
+  case "$name" in
+    dev|prod|stg|staging) echo "$name" ;;
+    prd) echo "prod" ;;
+    *) echo "" ;;
+  esac
 }
 
 # ── preflight: collect what is already done and what remains ────────────────

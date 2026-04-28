@@ -6,7 +6,9 @@
 awsvpnctl setup
 ```
 
-이 명령은 `~/Downloads`와 `~/Desktop` 아래의 `.ovpn` 파일을 찾고, profile 이름을 제안한 뒤, `etc/profiles/`로 복사합니다. 마지막으로 어떤 profile을 자동 연결할지 묻고 `etc/config.json`을 갱신합니다.
+이 명령은 `~/Downloads`와 `~/Desktop` 아래에서 AWS Client VPN export로 보이는 `.ovpn` 파일을 찾고, profile 이름을 제안한 뒤, `etc/profiles/`로 복사합니다. 마지막으로 어떤 profile을 자동 연결할지 묻고 `etc/config.json`을 갱신합니다.
+
+자동 탐색은 `aws-dev-*`, `aws-prod-*`, `downloaded-client-config.ovpn`처럼 AWS에서 받은 파일명만 후보로 잡습니다. 그 외 이름의 `.ovpn`은 자동으로 가져오지 않습니다.
 
 ## Common Flows
 
@@ -21,6 +23,8 @@ awsvpnctl setup
 ```bash
 awsvpnctl setup ~/Downloads/downloaded-client-config.ovpn
 ```
+
+자동 탐색에서 제외된 파일도 직접 지정하면 가져올 수 있습니다.
 
 profile 이름 지정:
 

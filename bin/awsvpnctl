@@ -1089,6 +1089,19 @@ def _suggest_profile_name(path: Path) -> str:
     return _sanitize_profile_name(lower) or "vpn"
 
 
+def _is_setup_auto_candidate(path: Path) -> bool:
+    lower = path.stem.strip().lower()
+    if lower in {
+        "downloaded-client-config",
+        "client-config",
+        "development",
+        "develop",
+        "production",
+    }:
+        return True
+    return lower.startswith(("aws-dev-", "aws-prod-", "aws-prd-", "aws-stg-", "aws-staging-"))
+
+
 def _iter_ovpn_under(root: Path, max_depth: int = 4):
     root = root.expanduser()
     if not root.exists():
@@ -1137,7 +1150,7 @@ def _discover_setup_candidates(inputs: list[str], include_defaults: bool) -> lis
 
     if include_defaults:
         for base in SETUP_SEARCH_DIRS:
-            paths.extend(_iter_ovpn_under(base))
+            paths.extend(p for p in _iter_ovpn_under(base) if _is_setup_auto_candidate(p))
 
     filtered = []
     for p in _dedupe_paths(paths):
