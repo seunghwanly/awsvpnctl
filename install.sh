@@ -3,10 +3,12 @@
 #
 # Default: dry-run preflight, then prompt for confirmation, then execute.
 # Flags:
-#   --yes / -y    skip confirmation
-#   --check       just print the preflight report and exit
-#   --uninstall   remove sudoers, LaunchAgent, hammerspoon symlink (keeps profiles)
-#   --no-path     skip adding bin/ to shell rc
+#   --yes / -y          skip confirmation
+#   --check             just print the preflight report and exit
+#   --uninstall         remove sudoers, LaunchAgent, hammerspoon symlink (keeps profiles)
+#   --no-path           skip adding bin/ to shell rc
+#   --with-hammerspoon  install Hammerspoon.app via brew cask if missing, then wire menubar
+#   --no-hammerspoon    skip Hammerspoon menubar setup even if Hammerspoon.app is present
 set -euo pipefail
 
 SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && /bin/pwd -P)"
@@ -35,18 +37,27 @@ ASSUME_YES=0
 CHECK_ONLY=0
 UNINSTALL=0
 NO_PATH="${AWSVPNCTL_NO_PATH:-0}"
+WITH_HS="${AWSVPNCTL_WITH_HAMMERSPOON:-0}"
+NO_HS="${AWSVPNCTL_NO_HAMMERSPOON:-0}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -y|--yes)    ASSUME_YES=1; shift ;;
-    --check)     CHECK_ONLY=1; shift ;;
-    --uninstall) UNINSTALL=1; shift ;;
-    --no-path)   NO_PATH=1; shift ;;
+    -y|--yes)            ASSUME_YES=1; shift ;;
+    --check)             CHECK_ONLY=1; shift ;;
+    --uninstall)         UNINSTALL=1; shift ;;
+    --no-path)           NO_PATH=1; shift ;;
+    --with-hammerspoon)  WITH_HS=1; shift ;;
+    --no-hammerspoon)    NO_HS=1; shift ;;
     -h|--help)
       sed -n '2,11p' "$0" | sed 's/^# //; s/^#//'
       exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
 done
+
+if [[ $WITH_HS == 1 && $NO_HS == 1 ]]; then
+  echo "error: --with-hammerspoon and --no-hammerspoon are mutually exclusive" >&2
+  exit 2
+fi
 
 # ── output helpers ──────────────────────────────────────────────────────────
 if [[ -t 1 ]]; then
@@ -248,11 +259,20 @@ fi
 if check_sudoers;        then ok "sudoers fragment installed";        SUDOERS_DONE=1; else todo "sudoers fragment missing";        SUDOERS_DONE=0; fi
 if check_launchagent;    then ok "LaunchAgent loaded";                 LAUNCH_DONE=1;  else todo "LaunchAgent not loaded";          LAUNCH_DONE=0;  fi
 
-if check_hammerspoon_app; then
+HS_APP_INSTALL=0
+if [[ $NO_HS == 1 ]]; then
+  todo "Hammerspoon menubar disabled (--no-hammerspoon)"
+  HS_DONE=skip
+elif check_hammerspoon_app; then
   if check_hs_symlink;   then ok "Hammerspoon menubar wired up";       HS_DONE=1;     else todo "Hammerspoon menubar not wired";    HS_DONE=0;     fi
+elif [[ $WITH_HS == 1 ]]; then
+  todo "Hammerspoon.app not installed — will run: brew install --cask hammerspoon"
+  HS_APP_INSTALL=1
+  HS_DONE=0
 else
   fail "Hammerspoon.app not in /Applications (will skip menubar)"
-  note "install with: brew install --cask hammerspoon"
+  note "install separately with: brew install --cask hammerspoon"
+  note "or rerun with: $0 --with-hammerspoon"
   HS_DONE=skip
 fi
 
@@ -290,6 +310,7 @@ PLAN=()
 [[ $CONFIG_DONE   == 0 ]] && { PLAN+=("Seed $CONFIG_FILE auto_connect with installed profiles"); PENDING=$((PENDING+1)); }
 [[ $SUDOERS_DONE  == 0 ]] && { PLAN+=("Install $SUDOERS_TARGET (sudo password once)"); PENDING=$((PENDING+1)); }
 [[ $LAUNCH_DONE   == 0 ]] && { PLAN+=("Install + load LaunchAgent (auto-reconnect daemon)"); PENDING=$((PENDING+1)); }
+[[ $HS_APP_INSTALL == 1 ]] && { PLAN+=("Install Hammerspoon.app (brew install --cask hammerspoon)"); PENDING=$((PENDING+1)); }
 [[ $HS_DONE       == 0 ]] && { PLAN+=("Symlink Hammerspoon menubar"); PENDING=$((PENDING+1)); }
 [[ $PATH_DONE     == 0 ]] && { PLAN+=("Append PATH line to $SHELL_RC"); PENDING=$((PENDING+1)); }
 
@@ -406,6 +427,16 @@ do_install_launchagent() {
   ok "loaded — logs at $LOG_DIR/daemon.log"
 }
 
+do_install_hammerspoon_app() {
+  step "hammerspoon-app" "Installing Hammerspoon.app via Homebrew cask"
+  brew install --cask hammerspoon
+  if ! check_hammerspoon_app; then
+    die "brew install --cask hammerspoon completed but /Applications/Hammerspoon.app is missing"
+  fi
+  ok "/Applications/Hammerspoon.app installed"
+  note "macOS will ask you to grant Accessibility permission the first time you launch it"
+}
+
 do_install_hammerspoon() {
   step "hammerspoon" "Wiring up menubar"
   mkdir -p "$HAMMERSPOON_DIR"
@@ -447,6 +478,7 @@ do_path_update() {
 [[ $CONFIG_DONE   == 0 ]] && do_seed_config
 [[ $SUDOERS_DONE  == 0 ]] && do_install_sudoers
 [[ $LAUNCH_DONE   == 0 ]] && do_install_launchagent
+[[ $HS_APP_INSTALL == 1 ]] && do_install_hammerspoon_app
 [[ $HS_DONE       == 0 ]] && do_install_hammerspoon
 [[ $PATH_DONE     == 0 ]] && do_path_update
 

@@ -46,6 +46,8 @@ awsvpnctl logs dev -f
 aws sso login --sso-session <name>
 ```
 
+`<name>`은 `~/.aws/config`의 `[sso-session ...]` 블록 이름입니다. `grep '^\[sso-session' ~/.aws/config`로 사용 가능한 이름을 확인합니다.
+
 ## Documentation
 
 자세한 설치, 설정, 보안 모델, 트러블슈팅은 GitBook 문서 구조의 [docs/](docs/README.md)를 봅니다.

@@ -24,6 +24,16 @@ awsvpnctl daemon --interval 15
 aws sso login --sso-session <name>
 ```
 
+`<name>`은 `~/.aws/config`에 정의된 `[sso-session ...]` 블록 이름입니다. 사용 가능한 이름을 확인합니다.
+
+```bash
+grep '^\[sso-session' ~/.aws/config
+# [sso-session frontend-developer]
+# [sso-session backend-developer]
+```
+
+위 예에서는 `aws sso login --sso-session frontend-developer`처럼 사용합니다. `~/.aws/config`에 `[sso-session ...]` 블록이 없다면 먼저 `aws configure sso`로 추가해야 합니다. `awsvpnctl doctor`도 발견된 sso-session 이름을 같이 출력합니다.
+
 SSO token이 갱신되면 `etc/config.json`의 `auto_connect` 목록을 보고 필요한 profile을 연결합니다.
 
 ## Drop Recovery

@@ -34,11 +34,15 @@ cd ~/dev/awsvpnctl
 ## Installer Options
 
 ```bash
-./install.sh --check       # 점검만 실행
-./install.sh --yes         # 확인 프롬프트 생략
-./install.sh --no-path     # shell rc PATH 추가 생략
-./install.sh --uninstall   # sudoers, LaunchAgent, Hammerspoon symlink 제거
+./install.sh --check              # 점검만 실행
+./install.sh --yes                # 확인 프롬프트 생략
+./install.sh --no-path            # shell rc PATH 추가 생략
+./install.sh --uninstall          # sudoers, LaunchAgent, Hammerspoon symlink 제거
+./install.sh --with-hammerspoon   # Hammerspoon.app이 없으면 brew cask로 설치 후 메뉴바 연결
+./install.sh --no-hammerspoon     # Hammerspoon 메뉴바 셋업을 건너뛰기
 ```
+
+`Hammerspoon.app`이 `/Applications`에 없으면 메뉴바 셋업은 기본적으로 건너뜁니다. 설치까지 한번에 진행하려면 `--with-hammerspoon`을 추가하거나 직접 `brew install --cask hammerspoon`을 먼저 실행합니다. `awsvpnctl-install --with-hammerspoon` 형태로 Homebrew formula 경로에서도 동일하게 사용할 수 있습니다.
 
 ## What Install Does
 
