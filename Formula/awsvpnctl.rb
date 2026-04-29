@@ -3,7 +3,7 @@ class Awsvpnctl < Formula
   homepage "https://github.com/seunghwanly/awsvpnctl"
   url "https://github.com/seunghwanly/awsvpnctl.git",
       tag:      "v0.1.9",
-      revision: "5582453c15e7072d7fc88ad5ced518ec90aed466"
+      revision: "7cd8802be50fd6e66e1d7a15693d4d75588ec818"
   license :cannot_represent
 
   depends_on "python@3.14"
