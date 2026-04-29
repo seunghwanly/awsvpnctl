@@ -47,7 +47,6 @@ class OpenvpnAws < Formula
 
       For the awsvpnctl CLI, install:
         brew install awsvpnctl
-        awsvpnctl-install
         awsvpnctl setup
         awsvpnctl doctor
     EOS

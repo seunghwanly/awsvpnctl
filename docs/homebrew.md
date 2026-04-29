@@ -9,26 +9,11 @@ awsvpnctl은 Homebrew tap으로 설치할 수 있습니다.
 ```bash
 brew tap seunghwanly/awsvpnctl https://github.com/seunghwanly/awsvpnctl.git
 brew install awsvpnctl
-```
-
-설치가 끝나면 post-install 설정을 실행합니다.
-
-```bash
-awsvpnctl-install
 awsvpnctl setup
 awsvpnctl doctor
 ```
 
-## Why awsvpnctl-install Exists
-
-`brew install awsvpnctl`은 파일을 Cellar에 설치하는 단계만 처리합니다. macOS 권한이 필요한 작업은 사용자가 명시적으로 실행해야 합니다.
-
-`awsvpnctl-install`이 처리하는 것:
-
-- passwordless sudoers fragment 설치
-- LaunchAgent 설치 및 로드
-- Hammerspoon 메뉴바 symlink 연결
-- 기존 설치 상태 점검
+`brew install`은 파일을 Cellar에 설치합니다. macOS 권한이 필요한 OpenVPN, sudoers, LaunchAgent 구성은 사용자가 직접 실행한 `awsvpnctl setup`에서 설명과 확인 후 처리합니다.
 
 ## Installed Layout
 
@@ -49,16 +34,16 @@ State:    $(brew --prefix)/var/run/awsvpnctl
 ```bash
 brew update
 brew upgrade awsvpnctl
-awsvpnctl-install
+awsvpnctl setup --skip-import
 awsvpnctl doctor
 ```
 
-upgrade 후 `awsvpnctl-install`을 다시 실행하는 이유는 LaunchAgent와 sudoers가 현재 `opt` 경로를 가리키는지 확인하기 위해서입니다.
+upgrade 후 `setup --skip-import`를 다시 실행하는 이유는 LaunchAgent와 sudoers가 현재 `opt` 경로를 가리키는지 확인하기 위해서입니다.
 
 ## Uninstall
 
 ```bash
-awsvpnctl-install --uninstall
+awsvpnctl uninstall
 brew uninstall awsvpnctl
 ```
 

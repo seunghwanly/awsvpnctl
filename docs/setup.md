@@ -1,12 +1,14 @@
 # Initial Setup
 
-설치 후 사용자 설정은 `awsvpnctl setup`으로 처리합니다.
+첫 설치와 사용자 설정은 `awsvpnctl setup`으로 처리합니다.
 
 ```bash
 awsvpnctl setup
 ```
 
-이 명령은 `~/Downloads`와 `~/Desktop` 아래에서 AWS Client VPN export로 보이는 `.ovpn` 파일을 찾고, profile 이름을 제안한 뒤, `etc/profiles/`로 복사합니다. 마지막으로 어떤 profile을 자동 연결할지 묻고 `etc/config.json`을 갱신합니다.
+이 명령은 필요한 시스템 구성(OpenVPN, 제한된 sudoers, LaunchAgent)을 확인/설치한 뒤 `~/Downloads`와 `~/Desktop` 아래에서 AWS Client VPN export로 보이는 `.ovpn` 파일을 찾습니다. 대화형 터미널에서는 Spacebar로 가져올 파일을 선택하고, profile 이름과 자동 연결 대상을 설정합니다.
+
+sudo가 필요한 단계에서는 이유를 먼저 설명하고 건너뛸지 묻습니다. 건너뛰면 import는 계속할 수 있지만 `connect`, daemon, `doctor` 일부 항목은 실패할 수 있습니다.
 
 자동 탐색은 `aws-dev-*`, `aws-prod-*`, `downloaded-client-config.ovpn`처럼 AWS에서 받은 파일명만 후보로 잡습니다. 그 외 이름의 `.ovpn`은 자동으로 가져오지 않습니다.
 
@@ -44,6 +46,18 @@ awsvpnctl setup ~/Downloads/dev.ovpn --name dev
 
 ```bash
 awsvpnctl setup --yes
+```
+
+시스템 설치 생략:
+
+```bash
+awsvpnctl setup --skip-system-install
+```
+
+Hammerspoon 메뉴바까지 설치:
+
+```bash
+awsvpnctl setup --with-hammerspoon
 ```
 
 자동 연결 비활성:

@@ -9,6 +9,9 @@ Subcommands:
   status [--json] [-w]   show state of all profiles (-w watches and updates)
   list                   list configured profiles
   logs <profile> [-f]    tail openvpn log for profile
+  setup                  install runtime integrations and import .ovpn profiles
+  doctor                 diagnose installation health
+  uninstall              remove runtime integrations (keeps profiles/logs)
   daemon                 background watcher (auto-reconnect, SSO-trigger)
 
 State files live under <project>/var/run/<profile>.*
@@ -22,6 +25,7 @@ import contextlib
 import datetime as dt
 import errno
 import fcntl
+import getpass
 import ipaddress
 import json
 import os
@@ -34,9 +38,11 @@ import signal
 import socket
 import subprocess
 import sys
+import termios
 import tempfile
 import threading
 import time
+import tty
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -56,14 +62,27 @@ LOG_DIR = _path_env("AWSVPNCTL_LOG_DIR", PROJECT_ROOT / "log")
 SUDO_RUNNER = _path_env(
     "AWSVPNCTL_SUDO_RUNNER", PROJECT_ROOT / "bin" / "aws-vpn-sudo-runner"
 )
+AWSVPNCTL_BIN = _path_env("AWSVPNCTL_BIN", PROJECT_ROOT / "bin" / "awsvpnctl")
 PROFILE_ALIASES = {
     "prd": "prod",
 }
 
+def _default_homebrew_prefix() -> Path:
+    if os.environ.get("HOMEBREW_PREFIX"):
+        return Path(os.environ["HOMEBREW_PREFIX"])
+    if shutil.which("brew"):
+        try:
+            return Path(subprocess.check_output(["brew", "--prefix"], text=True).strip())
+        except Exception:  # noqa: BLE001
+            pass
+    return Path("/opt/homebrew")
+
+
 AWS_CLIENT_OPENVPN_BIN = Path(
     "/Applications/AWS VPN Client/AWS VPN Client.app/Contents/Resources/openvpn/acvc-openvpn"
 )
-HOMEBREW_OPENVPN_BIN = Path("/opt/homebrew/opt/openvpn-aws/sbin/openvpn")
+HOMEBREW_PREFIX = _default_homebrew_prefix()
+HOMEBREW_OPENVPN_BIN = HOMEBREW_PREFIX / "opt/openvpn-aws/sbin/openvpn"
 DEFAULT_OPENVPN_BIN = AWS_CLIENT_OPENVPN_BIN if AWS_CLIENT_OPENVPN_BIN.exists() else HOMEBREW_OPENVPN_BIN
 OPENVPN_BIN = os.environ.get("OPENVPN_BIN", str(DEFAULT_OPENVPN_BIN))
 SAML_LISTEN_PORT = 35001
@@ -1051,10 +1070,442 @@ def saml_lock():
 # command: setup
 # ---------------------------------------------------------------------------
 
+SUDOERS_TARGET = Path("/etc/sudoers.d/aws-vpn-connector")
+LAUNCH_AGENT_DIR = Path.home() / "Library" / "LaunchAgents"
+LAUNCH_AGENT_LABEL = "com.awsvpnctl.daemon"
+LAUNCH_AGENT_TARGET = LAUNCH_AGENT_DIR / f"{LAUNCH_AGENT_LABEL}.plist"
+HAMMERSPOON_DIR = Path.home() / ".hammerspoon"
+HAMMERSPOON_TARGET = HAMMERSPOON_DIR / "awsvpnctl_hammerspoon.lua"
+HAMMERSPOON_CONFIG = HAMMERSPOON_DIR / "awsvpnctl_config.lua"
+HAMMERSPOON_SOURCE = PROJECT_ROOT / "hammerspoon" / "awsvpnctl_hammerspoon.lua"
+
 SETUP_SEARCH_DIRS = (
     Path.home() / "Downloads",
     Path.home() / "Desktop",
 )
+
+
+def _check_macos() -> bool:
+    return sys.platform == "darwin"
+
+
+def _check_brew() -> bool:
+    return shutil.which("brew") is not None
+
+
+def _brew_repository() -> Path:
+    out = subprocess.check_output(["brew", "--repository"], text=True).strip()
+    return Path(out)
+
+
+def _check_openvpn() -> bool:
+    return Path(OPENVPN_BIN).exists() and os.access(OPENVPN_BIN, os.X_OK)
+
+
+def _check_sudo_works() -> bool:
+    if not SUDO_RUNNER.exists():
+        return False
+    proc = subprocess.run(
+        ["/usr/bin/sudo", "-n", str(SUDO_RUNNER), "openvpn", "--version"],
+        capture_output=True,
+        text=True,
+    )
+    return proc.returncode == 0
+
+
+def _check_sudoers() -> bool:
+    return SUDOERS_TARGET.exists() and _check_sudo_works()
+
+
+def _check_launchagent() -> bool:
+    if not LAUNCH_AGENT_TARGET.exists():
+        return False
+    try:
+        text = LAUNCH_AGENT_TARGET.read_text(errors="ignore")
+    except OSError:
+        return False
+    if str(AWSVPNCTL_BIN) not in text or str(LOG_DIR / "daemon.log") not in text:
+        return False
+    proc = subprocess.run(
+        ["/bin/launchctl", "print", f"gui/{os.getuid()}/{LAUNCH_AGENT_LABEL}"],
+        capture_output=True,
+        text=True,
+    )
+    return proc.returncode == 0
+
+
+def _check_hammerspoon_app() -> bool:
+    return Path("/Applications/Hammerspoon.app").is_dir()
+
+
+def _check_hs_symlink() -> bool:
+    try:
+        return HAMMERSPOON_TARGET.is_symlink() and HAMMERSPOON_TARGET.resolve() == HAMMERSPOON_SOURCE.resolve()
+    except OSError:
+        return False
+
+
+def _hammerspoon_ctl_candidates() -> list[Path]:
+    candidates = [
+        AWSVPNCTL_BIN,
+        Path(shutil.which("awsvpnctl")) if shutil.which("awsvpnctl") else None,
+        Path("/opt/homebrew/bin/awsvpnctl"),
+        Path("/usr/local/bin/awsvpnctl"),
+    ]
+    out = []
+    seen = set()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            path = candidate.expanduser().resolve()
+        except OSError:
+            path = candidate.expanduser()
+        if path in seen or not path.exists():
+            continue
+        seen.add(path)
+        out.append(path)
+    return out
+
+
+def _hammerspoon_status_count(ctl: Path) -> int:
+    try:
+        proc = subprocess.run(
+            [str(ctl), "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if proc.returncode != 0:
+            return -1
+        parsed = json.loads(proc.stdout or "[]")
+        return len(parsed) if isinstance(parsed, list) else -1
+    except Exception:  # noqa: BLE001
+        return -1
+
+
+def _hammerspoon_project_for_ctl(ctl: Path) -> Path:
+    if ctl == AWSVPNCTL_BIN.resolve():
+        return PROJECT_ROOT
+    if ctl.parent.name == "bin":
+        return ctl.parent.parent
+    return PROJECT_ROOT
+
+
+def _hammerspoon_log_for_ctl(ctl: Path) -> Path:
+    if ctl == AWSVPNCTL_BIN.resolve():
+        return LOG_DIR / "daemon.log"
+    if str(ctl).startswith("/opt/homebrew/"):
+        return Path("/opt/homebrew/var/log/awsvpnctl/daemon.log")
+    if str(ctl).startswith("/usr/local/"):
+        return Path("/usr/local/var/log/awsvpnctl/daemon.log")
+    return _hammerspoon_project_for_ctl(ctl) / "log" / "daemon.log"
+
+
+def _hammerspoon_config_values() -> tuple[Path, Path, Path]:
+    candidates = _hammerspoon_ctl_candidates()
+    if not candidates:
+        return PROJECT_ROOT, AWSVPNCTL_BIN, LOG_DIR / "daemon.log"
+
+    current = AWSVPNCTL_BIN.resolve()
+
+    def score(ctl: Path) -> tuple[int, int]:
+        count = _hammerspoon_status_count(ctl)
+        return count, 1 if ctl == current else 0
+
+    ctl = max(candidates, key=score)
+    project = _hammerspoon_project_for_ctl(ctl)
+    return project, ctl, _hammerspoon_log_for_ctl(ctl)
+
+
+def _hammerspoon_config_text() -> str:
+    project, ctl, daemon_log = _hammerspoon_config_values()
+    return "\n".join([
+        "-- Generated by awsvpnctl setup.",
+        "-- Hammerspoon uses this so the menubar polls the same install that setup configured.",
+        "return {",
+        f"  PROJECT_ROOT = {json.dumps(str(project))},",
+        f"  CTL = {json.dumps(str(ctl))},",
+        f"  DAEMON_LOG = {json.dumps(str(daemon_log))},",
+        "}",
+        "",
+    ])
+
+
+def _check_hs_config() -> bool:
+    try:
+        text = HAMMERSPOON_CONFIG.read_text(errors="ignore")
+    except OSError:
+        return False
+    project, ctl, daemon_log = _hammerspoon_config_values()
+    return (
+        str(project) in text
+        and str(ctl) in text
+        and str(daemon_log) in text
+    )
+
+
+def _check_hammerspoon_wired() -> bool:
+    return _check_hs_symlink() and _check_hs_config()
+
+
+def _detect_shell_rc() -> Path:
+    shell = Path(os.environ.get("SHELL", "/bin/zsh")).name
+    if shell == "zsh":
+        return Path.home() / ".zshrc"
+    if shell == "bash":
+        bash_profile = Path.home() / ".bash_profile"
+        return bash_profile if bash_profile.exists() else Path.home() / ".bashrc"
+    return Path.home() / ".profile"
+
+
+def _path_in_rc(rc: Path) -> bool:
+    if os.environ.get("AWSVPNCTL_NO_PATH") == "1":
+        return True
+    try:
+        text = rc.read_text(errors="ignore")
+    except OSError:
+        return False
+    bin_dir = (PROJECT_ROOT / "bin").resolve()
+    for value in re.findall(r"/[^\s\"']*(?:aws-vpn-connector|awsvpnctl)/bin", text):
+        try:
+            if Path(value).resolve() == bin_dir:
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def _install_openvpn() -> None:
+    print("\n[openvpn] Building patched openvpn")
+    tap_name = "seunghwanly/awsvpnctl"
+    tap_dir = _brew_repository() / "Library/Taps/seunghwanly/homebrew-awsvpnctl"
+    if not tap_dir.exists():
+        subprocess.run(["brew", "tap-new", "--no-git", tap_name], check=True)
+    formula_dir = tap_dir / "Formula"
+    formula_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(PROJECT_ROOT / "Formula" / "openvpn-aws.rb", formula_dir / "openvpn-aws.rb")
+    env = os.environ.copy()
+    env["HOMEBREW_NO_INSTALL_FROM_API"] = "1"
+    subprocess.run(["brew", "install", "--build-from-source", f"{tap_name}/openvpn-aws"], check=True, env=env)
+    if not _check_openvpn():
+        raise SystemExit(f"openvpn build finished but binary missing: {OPENVPN_BIN}")
+
+
+def _install_sudoers() -> None:
+    print("\n[sudoers] Installing restricted sudo rule")
+    template = PROJECT_ROOT / "share" / "sudoers.aws-vpn-connector"
+    rendered = template.read_text().replace("{{USER}}", getpass.getuser()).replace("{{SUDO_RUNNER}}", str(SUDO_RUNNER))
+    with tempfile.NamedTemporaryFile("w", delete=False) as f:
+        f.write(rendered)
+        tmp = Path(f.name)
+    try:
+        subprocess.run(["/usr/sbin/visudo", "-cf", str(tmp)], check=True, stdout=subprocess.DEVNULL)
+        subprocess.run(["/usr/bin/sudo", "install", "-m", "0440", "-o", "root", "-g", "wheel", str(tmp), str(SUDOERS_TARGET)], check=True)
+    finally:
+        tmp.unlink(missing_ok=True)
+    if not _check_sudo_works():
+        raise SystemExit(f"sudo runner check failed; verify {SUDOERS_TARGET}")
+
+
+def _install_launchagent() -> None:
+    print("\n[launchd] Installing auto-reconnect daemon")
+    LAUNCH_AGENT_DIR.mkdir(parents=True, exist_ok=True)
+    template = PROJECT_ROOT / "share" / "com.awsvpnctl.daemon.plist"
+    rendered = (
+        template.read_text()
+        .replace("{{AWSVPNCTL_BIN}}", str(AWSVPNCTL_BIN))
+        .replace("{{LOG_DIR}}", str(LOG_DIR))
+    )
+    if subprocess.run(
+        ["/bin/launchctl", "print", f"gui/{os.getuid()}/{LAUNCH_AGENT_LABEL}"],
+        capture_output=True,
+        text=True,
+    ).returncode == 0:
+        subprocess.run(["/bin/launchctl", "bootout", f"gui/{os.getuid()}", str(LAUNCH_AGENT_TARGET)], check=False)
+    LAUNCH_AGENT_TARGET.write_text(rendered)
+    LAUNCH_AGENT_TARGET.chmod(0o644)
+    subprocess.run(["/bin/launchctl", "bootstrap", f"gui/{os.getuid()}", str(LAUNCH_AGENT_TARGET)], check=True)
+
+
+def _install_path_entry() -> None:
+    if os.environ.get("AWSVPNCTL_NO_PATH") == "1":
+        return
+    rc = _detect_shell_rc()
+    if _path_in_rc(rc):
+        return
+    print(f"\n[PATH] Adding awsvpnctl to {rc}")
+    rc.parent.mkdir(parents=True, exist_ok=True)
+    line = f'export PATH="{PROJECT_ROOT / "bin"}:$PATH"  # awsvpnctl'
+    with rc.open("a") as f:
+        f.write(f"\n{line}\n")
+
+
+def _install_hammerspoon_app() -> None:
+    print("\n[hammerspoon-app] Installing Hammerspoon.app")
+    subprocess.run(["brew", "install", "--cask", "hammerspoon"], check=True)
+    if not _check_hammerspoon_app():
+        raise SystemExit("brew cask finished but /Applications/Hammerspoon.app is missing")
+
+
+def _reload_hammerspoon() -> None:
+    if subprocess.run(["/usr/bin/pgrep", "-x", "Hammerspoon"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
+        return
+
+    hs_cli = Path("/Applications/Hammerspoon.app/Contents/Frameworks/hs/hs")
+    if hs_cli.exists():
+        proc = subprocess.run(
+            [str(hs_cli), "-q", "-c", "hs.reload()"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if proc.returncode == 0:
+            return
+
+    proc = subprocess.run(
+        ["/usr/bin/osascript", "-e", 'tell application "Hammerspoon" to execute lua code "hs.reload()"'],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if proc.returncode == 0:
+        return
+
+    print("  Hammerspoon is running, but automatic reload is disabled.")
+    print("  Click the Hammerspoon menu bar icon and choose Reload Config.")
+
+
+def _wire_hammerspoon() -> None:
+    print("\n[hammerspoon] Wiring menubar")
+    HAMMERSPOON_DIR.mkdir(parents=True, exist_ok=True)
+    if HAMMERSPOON_TARGET.is_symlink():
+        HAMMERSPOON_TARGET.unlink()
+    elif HAMMERSPOON_TARGET.exists():
+        backup = HAMMERSPOON_TARGET.with_name(
+            f"{HAMMERSPOON_TARGET.name}.backup-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        )
+        HAMMERSPOON_TARGET.rename(backup)
+        print(f"  backup: {backup}")
+    HAMMERSPOON_TARGET.symlink_to(HAMMERSPOON_SOURCE)
+    HAMMERSPOON_CONFIG.write_text(_hammerspoon_config_text())
+    init_lua = HAMMERSPOON_DIR / "init.lua"
+    try:
+        init_text = init_lua.read_text(errors="ignore")
+    except OSError:
+        init_text = ""
+    if "awsvpnctl_hammerspoon" not in init_text:
+        with init_lua.open("a") as f:
+            f.write('\nrequire("awsvpnctl_hammerspoon")\n')
+    _, ctl, _ = _hammerspoon_config_values()
+    print(f"  status source: {ctl}")
+    _reload_hammerspoon()
+
+
+def _system_setup_missing() -> list[str]:
+    missing = []
+    if not _check_openvpn():
+        missing.append("patched openvpn")
+    if not _check_sudoers():
+        missing.append("restricted sudo rule")
+    if not _check_launchagent():
+        missing.append("auto-reconnect LaunchAgent")
+    if not _path_in_rc(_detect_shell_rc()):
+        missing.append("shell PATH entry")
+    return missing
+
+
+def _print_privilege_explanation(missing: list[str]) -> None:
+    print("\nSystem install")
+    print(f"  Missing: {', '.join(missing)}")
+    print("  awsvpnctl needs sudo because OpenVPN creates utun interfaces and changes routes as root.")
+    print("  The sudoers rule is limited to aws-vpn-sudo-runner, not unrestricted sudo.")
+    print("  Skip is allowed, but connect/daemon doctor checks may keep failing until setup runs this step.")
+
+
+def _run_system_setup(args, interactive: bool) -> None:
+    if args.skip_system_install:
+        print("\nSystem install skipped (--skip-system-install)")
+        return
+    if not _check_macos():
+        raise SystemExit("awsvpnctl setup is macOS only")
+    if not _check_brew():
+        raise SystemExit("Homebrew not found. Install from https://brew.sh first.")
+    missing = _system_setup_missing()
+    if not missing:
+        print("\nSystem install: already complete")
+        return
+    _print_privilege_explanation(missing)
+    if not interactive and not args.yes:
+        print("  non-interactive shell: rerun with --yes to install system components")
+        return
+    if interactive and not _ask_bool("Install missing system components now", True):
+        print("  skipped system install")
+        return
+    if not _check_openvpn():
+        _install_openvpn()
+    if not _check_sudoers():
+        _install_sudoers()
+    if not _check_launchagent():
+        _install_launchagent()
+    _install_path_entry()
+
+
+def _run_hammerspoon_setup(args, interactive: bool) -> None:
+    if args.no_hammerspoon:
+        print("\nHammerspoon skipped (--no-hammerspoon)")
+        return
+    if _check_hammerspoon_app():
+        if _check_hammerspoon_wired():
+            print("\nHammerspoon: already wired")
+            _reload_hammerspoon()
+            return
+        if args.with_hammerspoon or (interactive and _ask_bool("Wire Hammerspoon menubar", True)):
+            _wire_hammerspoon()
+        return
+    should_install = args.with_hammerspoon or (interactive and _ask_bool("Install Hammerspoon menubar app", False))
+    if not should_install:
+        print("\nHammerspoon skipped")
+        return
+    _install_hammerspoon_app()
+    _wire_hammerspoon()
+
+
+def _remove_path_entry() -> None:
+    rc = _detect_shell_rc()
+    if not rc.exists():
+        return
+    try:
+        lines = rc.read_text().splitlines()
+    except OSError:
+        return
+    needle = str(PROJECT_ROOT / "bin")
+    kept = [line for line in lines if needle not in line]
+    if kept == lines:
+        return
+    backup = rc.with_suffix(rc.suffix + ".bak")
+    shutil.copy2(rc, backup)
+    rc.write_text("\n".join(kept) + "\n")
+    print(f"  removed PATH entry from {rc} (backup: {backup})")
+
+
+def cmd_uninstall(args) -> int:
+    print(f"\nUninstall runtime integrations: {PROJECT_ROOT}")
+    if LAUNCH_AGENT_TARGET.exists():
+        subprocess.run(["/bin/launchctl", "bootout", f"gui/{os.getuid()}", str(LAUNCH_AGENT_TARGET)], check=False)
+        LAUNCH_AGENT_TARGET.unlink(missing_ok=True)
+        print("  removed LaunchAgent")
+    if HAMMERSPOON_TARGET.is_symlink():
+        HAMMERSPOON_TARGET.unlink()
+        print("  removed Hammerspoon symlink")
+    if HAMMERSPOON_CONFIG.exists():
+        HAMMERSPOON_CONFIG.unlink()
+        print("  removed Hammerspoon config")
+    if SUDOERS_TARGET.exists():
+        subprocess.run(["/usr/bin/sudo", "rm", "-f", str(SUDOERS_TARGET)], check=True)
+        print("  removed sudoers fragment")
+    if not args.keep_path:
+        _remove_path_entry()
+    print("\nKept profiles, config, logs, Homebrew packages, and tap.")
+    return 0
 
 
 def _sanitize_profile_name(value: str) -> str:
@@ -1207,6 +1658,69 @@ def _ask_bool(prompt: str, default: bool = True) -> bool:
         print("  answer y or n")
 
 
+def _read_setup_key() -> str:
+    ch = sys.stdin.read(1)
+    if ch == "\x1b":
+        rest = sys.stdin.read(2)
+        return ch + rest
+    return ch
+
+
+def _select_setup_candidates(candidates: list[Path]) -> list[Path]:
+    if not candidates:
+        return []
+    selected = [True for _ in candidates]
+    cursor = 0
+    lines_drawn = 0
+
+    def draw() -> None:
+        nonlocal lines_drawn
+        if lines_drawn:
+            sys.stdout.write(f"\033[{lines_drawn}F")
+        rows = [
+            "Select .ovpn files (Space toggle, Enter import, a all, n none, q cancel)",
+        ]
+        for i, path in enumerate(candidates):
+            pointer = ">" if i == cursor else " "
+            checked = "[x]" if selected[i] else "[ ]"
+            rows.append(f"  {pointer} {checked} {path.name} -> {_suggest_profile_name(path)}")
+        for row in rows:
+            sys.stdout.write("\033[2K" + row + "\n")
+        sys.stdout.flush()
+        lines_drawn = len(rows)
+
+    old = termios.tcgetattr(sys.stdin.fileno())
+    try:
+        tty.setcbreak(sys.stdin.fileno())
+        sys.stdout.write("\033[?25l")
+        draw()
+        while True:
+            key = _read_setup_key()
+            if key in {"\r", "\n"}:
+                break
+            if key in {"q", "Q", "\x03"}:
+                selected = [False for _ in candidates]
+                break
+            if key == " ":
+                selected[cursor] = not selected[cursor]
+            elif key in {"a", "A"}:
+                selected = [True for _ in candidates]
+            elif key in {"n", "N"}:
+                selected = [False for _ in candidates]
+            elif key in {"\x1b[B", "j", "J"}:
+                cursor = (cursor + 1) % len(candidates)
+            elif key in {"\x1b[A", "k", "K"}:
+                cursor = (cursor - 1) % len(candidates)
+            draw()
+    finally:
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
+        sys.stdout.write("\033[?25h")
+        sys.stdout.flush()
+    chosen = [path for path, is_selected in zip(candidates, selected) if is_selected]
+    print(f"\nSelected: {_format_profile_list([p.name for p in chosen])}")
+    return chosen
+
+
 def _parse_auto_connect_value(value: str) -> list[str]:
     raw = value.strip()
     if raw.lower() in {"all", "*"}:
@@ -1251,8 +1765,11 @@ def cmd_setup(args) -> int:
     CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"\nSetup: {PROJECT_ROOT}")
+    _run_system_setup(args, interactive)
+    _run_hammerspoon_setup(args, interactive)
 
     candidates = _discover_setup_candidates(args.ovpn, not args.no_discover)
+    skipped: list[str] = []
     if candidates:
         print("\nCandidate .ovpn files")
         for i, path in enumerate(candidates, 1):
@@ -1264,10 +1781,12 @@ def cmd_setup(args) -> int:
         print("  awsvpnctl setup ~/Downloads/downloaded-client-config.ovpn")
 
     imported: list[str] = []
-    skipped: list[str] = []
     should_import = bool(candidates) and not args.skip_import
     if candidates and interactive and not args.skip_import:
-        should_import = _ask_bool("Import these .ovpn files", True)
+        selected = _select_setup_candidates(candidates)
+        skipped.extend(f"{src.name} (not selected)" for src in candidates if src not in selected)
+        candidates = selected
+        should_import = bool(candidates)
     if args.skip_import:
         should_import = False
         skipped.extend(f"{src.name} (--skip-import)" for src in candidates)
@@ -1404,7 +1923,7 @@ def cmd_connect(args) -> int:
 
     if not Path(OPENVPN_BIN).exists():
         raise SystemExit(
-            f"patched openvpn not found at {OPENVPN_BIN}. Run install.sh first."
+            f"patched openvpn not found at {OPENVPN_BIN}. Run `awsvpnctl setup` first."
         )
     if not SUDO_RUNNER.exists():
         raise SystemExit(f"sudo runner not found at {SUDO_RUNNER}")
@@ -1770,7 +2289,7 @@ def cmd_doctor(args) -> int:
 
     def chk_openvpn():
         if not Path(OPENVPN_BIN).exists():
-            return False, f"missing: {OPENVPN_BIN} (run install.sh)"
+            return False, f"missing: {OPENVPN_BIN} (run `awsvpnctl setup`)"
         try:
             ver = subprocess.check_output([OPENVPN_BIN, "--version"], text=True,
                                           stderr=subprocess.STDOUT).splitlines()[0]
@@ -1788,7 +2307,7 @@ def cmd_doctor(args) -> int:
         )
         if proc.returncode == 0:
             return True, None
-        return False, "passwordless sudo for the runner is not working — run install.sh"
+        return False, "passwordless sudo for the runner is not working — run `awsvpnctl setup`"
 
     def chk_launchagent():
         label = "com.awsvpnctl.daemon"
@@ -1825,9 +2344,14 @@ def cmd_doctor(args) -> int:
         target = Path.home() / ".hammerspoon" / "awsvpnctl_hammerspoon.lua"
         if not target.exists():
             return ("warn", "hammerspoon symlink not found (menubar disabled)")
-        if target.is_symlink():
-            return True, f"→ {os.readlink(target)}"
-        return ("warn", "exists but is not a symlink to this repo")
+        if not target.is_symlink():
+            return ("warn", "exists but is not a symlink to this install")
+        if not _check_hs_symlink():
+            return ("warn", f"points to another install: {os.readlink(target)}")
+        if not _check_hs_config():
+            return ("warn", f"config missing or stale: {HAMMERSPOON_CONFIG}")
+        _, ctl, _ = _hammerspoon_config_values()
+        return True, f"→ {os.readlink(target)}; ctl={ctl}"
 
     def chk_profiles():
         ps = list_profiles()
@@ -2067,7 +2591,7 @@ def main(argv=None) -> int:
     p.add_argument("-f", "--follow", action="store_true")
     p.set_defaults(func=cmd_logs)
 
-    p = sub.add_parser("setup", help="import .ovpn profiles and configure auto-connect")
+    p = sub.add_parser("setup", help="install runtime integrations, import .ovpn profiles, and configure auto-connect")
     p.add_argument("ovpn", nargs="*",
                    help=".ovpn file(s) or directories to import; defaults to scanning ~/Downloads and ~/Desktop")
     p.add_argument("-y", "--yes", action="store_true",
@@ -2082,6 +2606,12 @@ def main(argv=None) -> int:
                    help="show discovered .ovpn files but do not import them")
     p.add_argument("--no-discover", action="store_true",
                    help="do not scan ~/Downloads and ~/Desktop")
+    p.add_argument("--skip-system-install", action="store_true",
+                   help="skip OpenVPN, sudoers, LaunchAgent, and PATH setup")
+    p.add_argument("--with-hammerspoon", action="store_true",
+                   help="install Hammerspoon.app if missing, then wire the menubar")
+    p.add_argument("--no-hammerspoon", action="store_true",
+                   help="skip Hammerspoon app install and menubar setup")
     p.set_defaults(func=cmd_setup)
 
     p = sub.add_parser("daemon", help="background watcher loop")
@@ -2091,11 +2621,18 @@ def main(argv=None) -> int:
     p = sub.add_parser("doctor", help="diagnose installation health")
     p.set_defaults(func=cmd_doctor)
 
+    p = sub.add_parser("uninstall", help="remove runtime integrations")
+    p.add_argument("--keep-path", action="store_true",
+                   help="do not remove the source checkout PATH entry from the shell rc")
+    p.set_defaults(func=cmd_uninstall)
+
     p = sub.add_parser("reconcile",
         help="adopt running openvpn processes whose iface state was lost (recover from crashes without re-doing SAML)")
     p.set_defaults(func=cmd_reconcile)
 
     args = parser.parse_args(argv)
+    if getattr(args, "with_hammerspoon", False) and getattr(args, "no_hammerspoon", False):
+        parser.error("--with-hammerspoon and --no-hammerspoon are mutually exclusive")
     return args.func(args) or 0
 
 

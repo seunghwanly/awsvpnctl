@@ -2,22 +2,15 @@
 
 ## Remove Runtime Integrations
 
-Homebrew install:
-
 ```bash
-awsvpnctl-install --uninstall
-```
-
-Source checkout:
-
-```bash
-./install.sh --uninstall
+awsvpnctl uninstall
 ```
 
 제거 대상:
 
 - LaunchAgent
 - Hammerspoon symlink
+- Hammerspoon awsvpnctl config
 - sudoers fragment
 - shell rc PATH entry
 

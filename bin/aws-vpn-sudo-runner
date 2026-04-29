@@ -14,6 +14,8 @@ AWS_CLIENT_OPENVPN_BIN="/Applications/AWS VPN Client/AWS VPN Client.app/Contents
 DEFAULT_OPENVPN_BIN="/opt/homebrew/opt/openvpn-aws/sbin/openvpn"
 if [[ -x "$AWS_CLIENT_OPENVPN_BIN" ]]; then
   DEFAULT_OPENVPN_BIN="$AWS_CLIENT_OPENVPN_BIN"
+elif [[ -x "/usr/local/opt/openvpn-aws/sbin/openvpn" ]]; then
+  DEFAULT_OPENVPN_BIN="/usr/local/opt/openvpn-aws/sbin/openvpn"
 fi
 OPENVPN_BIN="${OPENVPN_BIN:-$DEFAULT_OPENVPN_BIN}"
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

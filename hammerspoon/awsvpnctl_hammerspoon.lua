@@ -1,6 +1,7 @@
 -- awsvpnctl_hammerspoon.lua
--- Menubar item for awsvpnctl. Polls `awsvpnctl status --json` and
--- exposes per-profile connect/disconnect actions in the dropdown.
+-- Menubar item for awsvpnctl. Polls the setup-configured
+-- `awsvpnctl status --json` and exposes per-profile connect/disconnect
+-- actions in the dropdown.
 --
 -- Replaces the legacy AWS-config-watching variant: this one shows ACTUAL VPN
 -- tunnel state (utun + openvpn pid), not whether profiles exist in ~/.aws/config.
@@ -13,6 +14,34 @@ if M.cleanup then
 end
 
 local HOME = os.getenv("HOME")
+
+local function shellQuote(s)
+  return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+end
+
+local function loadConfigOverrides()
+  local path = HOME .. "/.hammerspoon/awsvpnctl_config.lua"
+  if not hs.fs.attributes(path) then
+    return {}
+  end
+
+  local chunk, loadErr = loadfile(path)
+  if not chunk then
+    print("[awsvpn] failed to load " .. path .. ": " .. tostring(loadErr))
+    return {}
+  end
+
+  local ok, cfg = pcall(chunk)
+  if not ok then
+    print("[awsvpn] failed to read " .. path .. ": " .. tostring(cfg))
+    return {}
+  end
+  if type(cfg) ~= "table" then
+    print("[awsvpn] ignored " .. path .. ": expected table")
+    return {}
+  end
+  return cfg
+end
 
 local function detectProjectRoot()
   local candidates = {
@@ -57,12 +86,13 @@ local function detectDaemonLog(projectRoot)
   return projectRoot .. "/log/daemon.log"
 end
 
-local PROJECT_ROOT = detectProjectRoot()
+local OVERRIDES = loadConfigOverrides()
+local PROJECT_ROOT = OVERRIDES.PROJECT_ROOT or detectProjectRoot()
 
 local CONFIG = {
   PROJECT_ROOT = PROJECT_ROOT,
-  CTL = detectCtl(PROJECT_ROOT),
-  DAEMON_LOG = detectDaemonLog(PROJECT_ROOT),
+  CTL = OVERRIDES.CTL or detectCtl(PROJECT_ROOT),
+  DAEMON_LOG = OVERRIDES.DAEMON_LOG or detectDaemonLog(PROJECT_ROOT),
   POLL_INTERVAL = 5,        -- seconds between status polls
   ACTION_FLASH_SECONDS = 0.4,
   QUICK_PROFILES = { "dev", "prd" },
@@ -88,10 +118,6 @@ end
 
 local function commandProfile(profile)
   return CONFIG.COMMAND_NAMES[profile] or profile
-end
-
-local function shellQuote(s)
-  return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
 end
 
 local function fmtDuration(sec)
@@ -122,7 +148,7 @@ local function buildTitle(rows)
 end
 
 local function runCtl(args, callback)
-  local cmd = CTL .. " " .. args
+  local cmd = shellQuote(CTL) .. " " .. args
   local task = hs.task.new("/bin/sh", function(rc, out, errOut)
     if callback then callback(rc, out or "", errOut or "") end
   end, { "-c", cmd })
@@ -329,7 +355,7 @@ local function initialize()
     M.menuBar:setTitle(CONFIG.ICONS.NO_CONFIG .. " VPN")
     M.menuBar:setMenu({
       { title = "awsvpnctl not installed at " .. CTL, disabled = true },
-      { title = "Run awsvpnctl-install or install.sh", disabled = true },
+      { title = "Run awsvpnctl setup", disabled = true },
     })
     return
   end

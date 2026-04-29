@@ -35,7 +35,6 @@ class Awsvpnctl < Formula
   def caveats
     <<~EOS
       Finish setup after installing:
-        awsvpnctl-install
         awsvpnctl setup
         awsvpnctl doctor
 
