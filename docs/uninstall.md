@@ -36,7 +36,7 @@ brew untap seunghwanly/awsvpnctl
 
 ## Remove Local Data
 
-주의: `.ovpn` profile도 삭제됩니다.
+주의: `.ovpn` profile도 삭제돼요.
 
 ```bash
 rm -rf etc/profiles/*.ovpn
@@ -45,4 +45,4 @@ rm -rf log/*
 rm -rf var/run/*
 ```
 
-디렉터리 placeholder를 유지하려면 `.gitkeep`은 지우지 않아도 됩니다.
+디렉터리 placeholder를 유지하려면 `.gitkeep`은 지우지 않아도 돼요.

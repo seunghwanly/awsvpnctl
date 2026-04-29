@@ -1,6 +1,6 @@
 # Profiles
 
-awsvpnctl의 profile은 `etc/profiles/<name>.ovpn` 파일입니다. 별도의 profile 등록 DB는 없습니다.
+awsvpnctl의 profile은 `etc/profiles/<name>.ovpn` 파일이에요. 별도의 profile 등록 DB는 없어요.
 
 ## Naming
 
@@ -15,7 +15,7 @@ etc/profiles/prod.ovpn  -> awsvpnctl connect prod
 prd -> prod
 ```
 
-따라서 `prod.ovpn`이 있으면 다음 명령도 동작합니다.
+따라서 `prod.ovpn`이 있으면 다음 명령도 동작해요.
 
 ```bash
 awsvpnctl connect prd
@@ -49,11 +49,11 @@ awsvpnctl list
 awsvpnctl remove staging
 ```
 
-이 명령은 `etc/profiles/staging.ovpn`을 삭제하고 `etc/config.json`의 `auto_connect`에서도 `staging`을 제거합니다. 연결 중이면 먼저 끊습니다.
+이 명령은 `etc/profiles/staging.ovpn`을 삭제하고 `etc/config.json`의 `auto_connect`에서도 `staging`을 제거해요. 연결 중이면 먼저 끊어요.
 
 ## Auto Connect
 
-자동 연결 목록은 `etc/config.json`에 있습니다.
+자동 연결 목록은 `etc/config.json`에 있어요.
 
 ```json
 {
@@ -77,11 +77,11 @@ awsvpnctl remove staging
 }
 ```
 
-`awsvpnctl setup --auto ...`를 쓰면 직접 JSON을 편집하지 않아도 됩니다.
+`awsvpnctl setup --auto ...`를 쓰면 직접 JSON을 편집하지 않아도 돼요.
 
 ## What Must Be in the OVPN
 
-`.ovpn`에는 최소한 다음 정보가 있어야 합니다.
+`.ovpn`에는 최소한 다음 정보가 있어야 해요.
 
 - `remote` directive
 - `proto` directive 또는 기본 UDP 사용 가능 상태
@@ -89,4 +89,4 @@ awsvpnctl remove staging
 - `auth-federate`
 - 인증서/CA 관련 설정
 
-`auth-federate`가 없으면 AWS SAML 흐름이 동작하지 않을 수 있습니다.
+`auth-federate`가 없으면 AWS SAML 흐름이 동작하지 않을 수 있어요.
