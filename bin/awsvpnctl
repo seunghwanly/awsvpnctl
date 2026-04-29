@@ -88,6 +88,7 @@ OPENVPN_BIN = os.environ.get("OPENVPN_BIN", str(DEFAULT_OPENVPN_BIN))
 SAML_LISTEN_PORT = 35001
 SAML_TIMEOUT_SEC = 180
 CONNECT_TIMEOUT_SEC = 45
+SLEEP_GUARD_PID_FILE = VAR_RUN / "sleep-guard.pid"
 
 VAR_RUN.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -212,6 +213,94 @@ def pid_alive(pid: int) -> bool:
         return True
     except OSError as e:
         return e.errno == errno.EPERM
+
+
+def _process_command(pid: int) -> str | None:
+    try:
+        return subprocess.check_output(
+            ["/bin/ps", "-p", str(pid), "-o", "command="],
+            text=True,
+        ).strip()
+    except subprocess.CalledProcessError:
+        return None
+
+
+def _sleep_guard_pid() -> int | None:
+    if not SLEEP_GUARD_PID_FILE.exists():
+        return None
+    try:
+        return int(SLEEP_GUARD_PID_FILE.read_text().strip())
+    except ValueError:
+        return None
+
+
+def _sleep_guard_running() -> int | None:
+    pid = _sleep_guard_pid()
+    if not pid or not pid_alive(pid):
+        SLEEP_GUARD_PID_FILE.unlink(missing_ok=True)
+        return None
+    cmd = _process_command(pid)
+    if cmd and "caffeinate" in cmd:
+        return pid
+    SLEEP_GUARD_PID_FILE.unlink(missing_ok=True)
+    return None
+
+
+def _reap_child(pid: int) -> bool:
+    try:
+        done, _status = os.waitpid(pid, os.WNOHANG)
+        return done == pid
+    except ChildProcessError:
+        return False
+
+
+def _start_sleep_guard() -> None:
+    if _sleep_guard_running():
+        return
+    caffeinate = "/usr/bin/caffeinate"
+    if not Path(caffeinate).exists():
+        warn("[sleep] caffeinate not found; cannot prevent idle sleep while VPN is connected")
+        return
+    proc = subprocess.Popen(
+        [caffeinate, "-i"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    SLEEP_GUARD_PID_FILE.write_text(str(proc.pid))
+    info(f"[sleep] idle sleep guard started (pid={proc.pid})")
+
+
+def _stop_sleep_guard() -> None:
+    pid = _sleep_guard_running()
+    if not pid:
+        return
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGTERM)
+    for _ in range(10):
+        if _reap_child(pid):
+            break
+        if not pid_alive(pid):
+            break
+        time.sleep(0.1)
+    if pid_alive(pid):
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
+        _reap_child(pid)
+    SLEEP_GUARD_PID_FILE.unlink(missing_ok=True)
+    info(f"[sleep] idle sleep guard stopped (pid={pid})")
+
+
+def _connected_profiles() -> list[str]:
+    return [profile for profile in list_profiles() if is_connected(profile)]
+
+
+def _refresh_sleep_guard() -> None:
+    if _connected_profiles():
+        _start_sleep_guard()
+    else:
+        _stop_sleep_guard()
 
 
 def is_connected(profile: str) -> bool:
@@ -684,6 +773,7 @@ def connect_with_saml(
     write_state(profile, "endpoint", f"{ip}:{port}/{proto}")
     write_state(profile, "connected_at", str(int(time.time())))
     info(f"[connect] {profile} up on {iface}")
+    _refresh_sleep_guard()
 
 
 def connect_with_management(
@@ -756,6 +846,7 @@ def connect_with_management(
     write_state(profile, "endpoint", f"{ip}:{port}/{proto}")
     write_state(profile, "connected_at", str(int(time.time())))
     info(f"[connect] {profile} up on {iface}")
+    _refresh_sleep_guard()
 
 
 def _free_tcp_port() -> int:
@@ -1132,6 +1223,22 @@ def _check_launchagent() -> bool:
         text=True,
     )
     return proc.returncode == 0
+
+
+def _launchctl_domain() -> str:
+    return f"gui/{os.getuid()}"
+
+
+def _run_launchctl(args: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
+    proc = subprocess.run(
+        ["/bin/launchctl", *args],
+        capture_output=True,
+        text=True,
+    )
+    if check and proc.returncode != 0:
+        msg = (proc.stderr or proc.stdout or "").strip()
+        raise SystemExit(f"launchctl {' '.join(args)} failed: {msg}")
+    return proc
 
 
 def _check_hammerspoon_app() -> bool:
@@ -1952,6 +2059,7 @@ def cmd_disconnect(args) -> int:
     if pid is None:
         print(f"[{profile}] not running")
         # keep the .disabled flag so daemon respects user intent
+        _refresh_sleep_guard()
         return 0
     if pid_alive(pid):
         info(f"[disconnect] {profile} pid={pid}")
@@ -1962,6 +2070,7 @@ def cmd_disconnect(args) -> int:
     if disabled:
         state_path(profile, "disabled").write_text("user")
     print(f"[{profile}] disconnected")
+    _refresh_sleep_guard()
     return 0
 
 
@@ -2030,6 +2139,7 @@ def cmd_remove(args) -> int:
     if pid and pid_alive(pid):
         info(f"[remove] disconnecting {profile} pid={pid}")
         stop_profile_process(profile, pid)
+        _refresh_sleep_guard()
 
     auto_removed, remaining_auto = _remove_auto_connect_profile(profile)
 
@@ -2512,12 +2622,16 @@ def _safe_connect(profile: str) -> None:
 
 
 def cmd_daemon(args) -> int:
+    if getattr(args, "action", None) == "restart":
+        return cmd_daemon_restart(args)
+
     info("[daemon] started")
     last_sso_mtime = _sso_latest_mtime()
     last_reconnect_attempt: dict[str, float] = {}
 
     def handle_sigterm(_sig, _frm):
         info("[daemon] SIGTERM, exiting")
+        _stop_sleep_guard()
         sys.exit(0)
     signal.signal(signal.SIGTERM, handle_sigterm)
     signal.signal(signal.SIGINT, handle_sigterm)
@@ -2548,10 +2662,28 @@ def cmd_daemon(args) -> int:
                     info(f"[daemon] auto-connect {profile} (sso_ok={sso_ok})")
                     last_reconnect_attempt[profile] = time.time()
                     _safe_connect(profile)
+            _refresh_sleep_guard()
         except Exception as e:  # noqa: BLE001
             warn(f"[daemon] loop error: {e!r}")
 
         time.sleep(args.interval)
+
+
+def cmd_daemon_restart(_args) -> int:
+    if not _check_macos():
+        raise SystemExit("awsvpnctl daemon restart is macOS only")
+    if not LAUNCH_AGENT_TARGET.exists():
+        raise SystemExit(f"LaunchAgent plist not found: {LAUNCH_AGENT_TARGET}. Run `awsvpnctl setup` first.")
+
+    domain = _launchctl_domain()
+    bootout = _run_launchctl(["bootout", domain, str(LAUNCH_AGENT_TARGET)], check=False)
+    if bootout.returncode != 0:
+        msg = (bootout.stderr or bootout.stdout or "").strip()
+        if msg:
+            warn(f"[daemon] bootout skipped: {msg}")
+    _run_launchctl(["bootstrap", domain, str(LAUNCH_AGENT_TARGET)])
+    print(f"[daemon] restarted {LAUNCH_AGENT_LABEL}")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -2615,6 +2747,8 @@ def main(argv=None) -> int:
     p.set_defaults(func=cmd_setup)
 
     p = sub.add_parser("daemon", help="background watcher loop")
+    p.add_argument("action", nargs="?", choices=["restart"],
+                   help="daemon action; omit to run the watcher loop")
     p.add_argument("--interval", type=float, default=15.0)
     p.set_defaults(func=cmd_daemon)
 
