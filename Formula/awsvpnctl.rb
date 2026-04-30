@@ -2,8 +2,8 @@ class Awsvpnctl < Formula
   desc "macOS AWS Client VPN SAML SSO controller"
   homepage "https://github.com/seunghwanly/awsvpnctl"
   url "https://github.com/seunghwanly/awsvpnctl.git",
-      tag:      "v0.1.9",
-      revision: "7cd8802be50fd6e66e1d7a15693d4d75588ec818"
+      tag:      "v0.1.10",
+      revision: "5cd0bce3b0ca3b8163a975ef6c7d9aa1edda69d2"
   license :cannot_represent
 
   depends_on "python@3.14"
