@@ -373,6 +373,44 @@ def external_aws_client_status(profile: str) -> dict | None:
     return status
 
 
+def stop_external_aws_client(profile: str, status: dict) -> None:
+    """Stop the official AWS VPN Client openvpn process for this profile."""
+    pid = status["pid"]
+    state = "connected" if status.get("connected") else "running"
+    if not SUDO_RUNNER.exists():
+        raise SystemExit(
+            f"sudo runner not found at {SUDO_RUNNER}; "
+            "cannot stop AWS VPN Client openvpn"
+        )
+
+    warn(
+        f"[{profile}] AWS VPN Client openvpn is {state} (pid={pid}); "
+        "disconnecting before awsvpnctl reconnect"
+    )
+    stop_profile_process(profile, pid)
+
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        current = external_aws_client_pid(profile)
+        if not current:
+            return
+        if current != pid:
+            warn(
+                f"[{profile}] AWS VPN Client restarted openvpn "
+                f"(pid={current}); stopping it"
+            )
+            stop_profile_process(profile, current)
+            pid = current
+        time.sleep(0.25)
+
+    current = external_aws_client_pid(profile)
+    if current:
+        raise SystemExit(
+            f"[{profile}] AWS VPN Client openvpn is still running "
+            f"(pid={current}). Quit AWS VPN Client and retry."
+        )
+
+
 def _external_aws_client_latest_state(profile: str, pid: int) -> dict | None:
     log_dir = Path.home() / ".config" / "AWSVPNClient" / "logs"
     if not log_dir.exists():
@@ -2009,15 +2047,7 @@ def cmd_connect(args) -> int:
         return 0
     ext = external_aws_client_status(profile)
     if ext:
-        if ext["connected"]:
-            raise SystemExit(
-                f"[{profile}] already connected by AWS VPN Client (pid={ext['pid']}). "
-                "Disconnect it there before using awsvpnctl."
-            )
-        raise SystemExit(
-            f"[{profile}] AWS VPN Client openvpn is running (pid={ext['pid']}) "
-            "but not connected. Quit/disconnect AWS VPN Client before using awsvpnctl."
-        )
+        stop_external_aws_client(profile, ext)
 
     # Clean up an orphan openvpn process that lost its tunnel (e.g. SAML expiry
     # mid-session left the process alive but the utun gone). Otherwise we'd spawn
