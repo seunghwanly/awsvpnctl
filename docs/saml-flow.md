@@ -12,7 +12,7 @@ awsvpnctl connect <profile>
   -> AUTH_FAILED,CRV1 challenge에서 SAML URL/SID 획득
   -> browser open
   -> localhost:35001에서 SAMLResponse 수신
-  -> auth-user-pass credentials file로 CRV1 응답 전달
+  -> 같은 OpenVPN process의 management interface로 CRV1 응답 전달
   -> Initialization Sequence Completed
 ```
 

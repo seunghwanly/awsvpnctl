@@ -7,6 +7,7 @@ class OpenvpnAws < Formula
   url "https://github.com/OpenVPN/openvpn/archive/refs/tags/v2.6.12.tar.gz"
   sha256 "cbca5e13b2b1c4de5ef0361d37c44b5e97e8654948f80d95ca249b474108d4c0"
   version "2.6.12-aws"
+  revision 1
   license "GPL-2.0-only" => { with: "openvpn-openssl-exception" }
 
   patch do
@@ -25,6 +26,14 @@ class OpenvpnAws < Formula
   depends_on "pkcs11-helper"
 
   def install
+    # The AWS SAML patch expands USER_PASS_LEN only for non-PKCS11 builds.
+    # Homebrew's build enables PKCS11, so keep the management command buffer
+    # large enough for SAMLResponse payloads there as well.
+    inreplace "src/openvpn/misc.h" do |s|
+      s.gsub! "#define USER_PASS_LEN 4096", "#define USER_PASS_LEN (1 << 17)"
+      s.gsub! "#define USER_PASS_LEN 1 << 17", "#define USER_PASS_LEN (1 << 17)"
+    end
+
     # GitHub source archive lacks a configure script; bootstrap autotools.
     system "autoreconf", "-i", "-v", "-f"
     system "./configure",

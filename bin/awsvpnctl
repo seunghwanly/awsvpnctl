@@ -811,7 +811,9 @@ def _drive_management_auth(sock: socket.socket, profile: str) -> None:
             challenge = (sid, username, url)
             info(f"[challenge] SID={sid[:12]}… user={username!r} URL={url[:80]}…")
             saml = wait_for_saml(url)
-            response = urllib.parse.quote_plus(saml, safe="")
+            response = _SAMLHandler.saml_response_encoded or urllib.parse.quote_plus(
+                saml, safe=""
+            )
             _send_crv1_response(sock, challenge, response)
             sent_response = True
             continue
@@ -831,7 +833,7 @@ def _send_crv1_response(
     sid, username, _url = challenge
     info("[connect] sending SAML response to openvpn management")
     _mgmt_send(sock, f"username \"Auth\" {_mgmt_quote(username)}")
-    _mgmt_send(sock, f"password \"Auth\" CRV1::{sid}::{response}")
+    _mgmt_send(sock, f"password \"Auth\" {_mgmt_quote(f'CRV1::{sid}::{response}')}")
     info("[connect] SAML response sent to openvpn management")
 
 
@@ -1898,29 +1900,13 @@ def _cmd_connect_locked(profile: str, ovpn: Path) -> int:
         raise SystemExit(f"sudo runner not found at {SUDO_RUNNER}")
 
     host, port, proto = parse_endpoint(ovpn)
-    runtime_conf = build_runtime_conf(profile, ovpn, keep_auth_user_pass=False)
+    runtime_conf = build_runtime_conf(profile, ovpn, keep_auth_user_pass=True)
 
     with saml_lock():
         ip = resolve_random_host(host)
         info(f"[connect] {profile}: resolved {host} → {ip}")
         try:
-            url, sid, username = get_saml_challenge(runtime_conf, ip, port, proto)
-            saml_response = wait_for_saml(url)
-            saml_response_for_openvpn = (
-                _SAMLHandler.saml_response_encoded
-                or urllib.parse.quote_plus(saml_response, safe="")
-            )
-            connect_with_saml(
-                profile,
-                runtime_conf,
-                ip,
-                port,
-                proto,
-                sid,
-                username,
-                saml_response_for_openvpn,
-                "credentials-file",
-            )
+            connect_with_management(profile, runtime_conf, ip, port, proto)
         except AuthRejectedError as e:
             raise SystemExit(f"openvpn authentication failed: {e}") from e
 
