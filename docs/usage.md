@@ -21,6 +21,8 @@ awsvpnctl connect <profile_name>
 
 브라우저가 열리면 SSO 로그인을 완료해요. 성공하면 `utun` 인터페이스가 만들어져요. 예를 들어 setup에서 `dev.ovpn`을 가져왔다면 `awsvpnctl connect dev`를 써요.
 
+이미 같은 profile이 연결 중이어도 `connect`는 기존 OpenVPN process를 먼저 끊고 새 연결을 만들어요. 연결이 없으면 그대로 새로 연결해요.
+
 ## Connect Multiple Profiles
 
 각 profile은 별도 OpenVPN process와 별도 `utun` interface로 실행돼요.

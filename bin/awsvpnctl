@@ -1849,17 +1849,15 @@ def cmd_connect(args) -> int:
     # Manual `connect` clears any user-disabled sentinel from a previous disconnect.
     state_path(profile, "disabled").unlink(missing_ok=True)
 
-    if is_connected(profile):
-        print(f"[{profile}] already connected")
-        return 0
-
-    # Clean up an orphan openvpn process that lost its tunnel (e.g. SAML expiry
-    # mid-session left the process alive but the utun gone). Otherwise we'd spawn
-    # a second openvpn for the same profile.
-    orphan_pid = read_pid(profile)
-    if orphan_pid and pid_alive(orphan_pid):
-        warn(f"[{profile}] orphan openvpn pid={orphan_pid} (no live utun) — killing")
-        stop_profile_process(profile, orphan_pid)
+    # `connect` is an ensure-online command. If a previous process exists, stop
+    # it first so the result is always a fresh connection for the requested profile.
+    existing_pid = read_pid(profile)
+    if existing_pid and pid_alive(existing_pid):
+        if is_connected(profile):
+            info(f"[connect] {profile} already connected pid={existing_pid}; reconnecting")
+        else:
+            warn(f"[{profile}] orphan openvpn pid={existing_pid} (no live utun) — killing")
+        stop_profile_process(profile, existing_pid)
     clear_state(profile)
 
     if not Path(OPENVPN_BIN).exists():
