@@ -100,6 +100,10 @@ class AuthRejectedError(Exception):
     """OpenVPN reached the server, but the server rejected auth credentials."""
 
 
+class ConnectInProgressError(Exception):
+    """Another awsvpnctl connect command is already handling this profile."""
+
+
 # ---------------------------------------------------------------------------
 # logging helpers
 # ---------------------------------------------------------------------------
@@ -174,7 +178,7 @@ def read_state(profile: str, suffix: str) -> str | None:
 
 def clear_state(profile: str) -> None:
     for p in VAR_RUN.glob(f"{profile}.*"):
-        if p.name.endswith(".runtime.ovpn"):
+        if p.name.endswith((".runtime.ovpn", ".connect.lock")):
             continue
         with contextlib.suppress(FileNotFoundError):
             p.unlink()
@@ -994,6 +998,23 @@ def saml_lock():
         except OSError:
             info("[saml] another connect is running; waiting…")
             fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(f, fcntl.LOCK_UN)
+        finally:
+            f.close()
+
+
+@contextlib.contextmanager
+def profile_connect_lock(profile: str):
+    lock_path = state_path(profile, "connect.lock")
+    f = lock_path.open("w")
+    try:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            raise ConnectInProgressError(profile) from e
         yield
     finally:
         try:
@@ -1846,6 +1867,15 @@ def cmd_connect(args) -> int:
     profile = canonical_profile(args.profile)
     ovpn = profile_path(profile)
 
+    try:
+        with profile_connect_lock(profile):
+            return _cmd_connect_locked(profile, ovpn)
+    except ConnectInProgressError:
+        print(f"[{profile}] connect already in progress")
+        return 0
+
+
+def _cmd_connect_locked(profile: str, ovpn: Path) -> int:
     # Manual `connect` clears any user-disabled sentinel from a previous disconnect.
     state_path(profile, "disabled").unlink(missing_ok=True)
 
@@ -2410,6 +2440,8 @@ def _safe_connect(profile: str) -> None:
     try:
         cmd_connect(argparse.Namespace(profile=profile))
     except SystemExit as e:
+        if isinstance(e.code, int) and e.code == 0:
+            raise
         warn(f"[daemon] connect {profile} failed: {e}")
     except Exception as e:  # noqa: BLE001
         warn(f"[daemon] connect {profile} crashed: {e!r}")

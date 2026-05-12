@@ -12,6 +12,7 @@ local M = _G.AWSVPNCTL_HAMMERSPOON
 if M.cleanup then
   M.cleanup()
 end
+M.inFlight = {}
 
 local HOME = os.getenv("HOME")
 
@@ -120,6 +121,27 @@ local function commandProfile(profile)
   return CONFIG.COMMAND_NAMES[profile] or profile
 end
 
+local function actionKey(action, profile)
+  return action .. ":" .. commandProfile(profile)
+end
+
+local function isInFlight(action, profile)
+  return M.inFlight[actionKey(action, profile)] == true
+end
+
+local function setInFlight(action, profile, value)
+  M.inFlight[actionKey(action, profile)] = value and true or nil
+end
+
+local function anyConnectInFlight()
+  for key, active in pairs(M.inFlight) do
+    if active and key:match("^connect:") then
+      return true
+    end
+  end
+  return false
+end
+
 local function fmtDuration(sec)
   if not sec or sec < 1 then return "" end
   if sec < 60 then return sec .. "s" end
@@ -180,7 +202,12 @@ local function setMenu(rows)
       end
       table.insert(items, { title = label, disabled = true })
 
-      if r.connected then
+      if isInFlight("connect", r.profile) then
+        table.insert(items, {
+          title = "      Connecting " .. labelProfile,
+          disabled = true,
+        })
+      elseif r.connected then
         table.insert(items, {
           title = "      Disconnect " .. labelProfile,
           fn = function() M.actionDisconnect(r.profile) end,
@@ -198,16 +225,19 @@ local function setMenu(rows)
   for _, profile in ipairs(CONFIG.QUICK_PROFILES) do
     table.insert(items, {
       title = "Connect " .. profile,
+      disabled = isInFlight("connect", profile),
       fn = function() M.actionConnect(profile) end,
     })
   end
   table.insert(items, {
     title = "Connect dev + prd",
+    disabled = anyConnectInFlight(),
     fn = function() M.actionConnectProfiles(CONFIG.QUICK_PROFILES) end,
   })
   table.insert(items, { title = "-" })
   table.insert(items, {
     title = "Connect all",
+    disabled = anyConnectInFlight(),
     fn = function() M.actionConnectAll() end,
   })
   table.insert(items, {
@@ -258,9 +288,15 @@ function M.refreshNow()
   end)
 end
 
-function M.actionConnect(profile)
+function M.actionConnect(profile, callback)
   local cmdProfile = commandProfile(profile)
   local labelProfile = displayProfile(profile)
+  if isInFlight("connect", profile) then
+    print("[awsvpn] connect " .. labelProfile .. " skipped: already in progress")
+    if callback then callback(false) end
+    return
+  end
+  setInFlight("connect", profile, true)
   setBusyTitle("connect " .. labelProfile)
   hs.notify.new({
     title = "AWS VPN",
@@ -279,7 +315,12 @@ function M.actionConnect(profile)
         informativeText = labelProfile .. " connected",
       }):send()
     end
-    M.refreshNow()
+    setInFlight("connect", profile, false)
+    if callback then
+      callback(rc == 0)
+    else
+      M.refreshNow()
+    end
   end)
 end
 
@@ -293,9 +334,24 @@ function M.actionDisconnect(profile)
 end
 
 function M.actionConnectProfiles(profiles)
+  local queue = {}
   for _, profile in ipairs(profiles) do
-    M.actionConnect(profile)
+    table.insert(queue, profile)
   end
+
+  local i = 1
+  local function nextProfile()
+    if i > #queue then
+      M.refreshNow()
+      return
+    end
+    local profile = queue[i]
+    i = i + 1
+    M.actionConnect(profile, function()
+      nextProfile()
+    end)
+  end
+  nextProfile()
 end
 
 function M.actionConnectAll()
@@ -304,11 +360,13 @@ function M.actionConnectAll()
     if rc ~= 0 then return end
     local ok, parsed = pcall(hs.json.decode, out)
     if not ok or not parsed then return end
+    local profiles = {}
     for _, r in ipairs(parsed) do
       if not r.connected then
-        M.actionConnect(r.profile)
+        table.insert(profiles, r.profile)
       end
     end
+    M.actionConnectProfiles(profiles)
   end)
 end
 
