@@ -1898,13 +1898,25 @@ def _cmd_connect_locked(profile: str, ovpn: Path) -> int:
         raise SystemExit(f"sudo runner not found at {SUDO_RUNNER}")
 
     host, port, proto = parse_endpoint(ovpn)
-    runtime_conf = build_runtime_conf(profile, ovpn, keep_auth_user_pass=True)
+    runtime_conf = build_runtime_conf(profile, ovpn, keep_auth_user_pass=False)
 
     with saml_lock():
         ip = resolve_random_host(host)
         info(f"[connect] {profile}: resolved {host} → {ip}")
         try:
-            connect_with_management(profile, runtime_conf, ip, port, proto)
+            url, sid, username = get_saml_challenge(runtime_conf, ip, port, proto)
+            saml_response = wait_for_saml(url)
+            connect_with_saml(
+                profile,
+                runtime_conf,
+                ip,
+                port,
+                proto,
+                sid,
+                username,
+                saml_response,
+                "credentials-file",
+            )
         except AuthRejectedError as e:
             raise SystemExit(f"openvpn authentication failed: {e}") from e
 

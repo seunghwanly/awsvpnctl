@@ -1,6 +1,6 @@
 # SAML Flow
 
-awsvpnctl은 AWS Client VPN의 SAML federated auth 흐름을 OpenVPN management interface로 처리해요.
+awsvpnctl은 AWS Client VPN의 SAML federated auth 흐름을 OpenVPN과 localhost callback으로 처리해요.
 
 ## High-Level Flow
 
@@ -12,7 +12,7 @@ awsvpnctl connect <profile>
   -> AUTH_FAILED,CRV1 challenge에서 SAML URL/SID 획득
   -> browser open
   -> localhost:35001에서 SAMLResponse 수신
-  -> management interface로 CRV1 응답 전달
+  -> auth-user-pass credentials file로 CRV1 응답 전달
   -> Initialization Sequence Completed
 ```
 
