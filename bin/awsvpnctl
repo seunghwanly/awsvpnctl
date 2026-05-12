@@ -1906,6 +1906,10 @@ def _cmd_connect_locked(profile: str, ovpn: Path) -> int:
         try:
             url, sid, username = get_saml_challenge(runtime_conf, ip, port, proto)
             saml_response = wait_for_saml(url)
+            saml_response_for_openvpn = (
+                _SAMLHandler.saml_response_encoded
+                or urllib.parse.quote_plus(saml_response, safe="")
+            )
             connect_with_saml(
                 profile,
                 runtime_conf,
@@ -1914,7 +1918,7 @@ def _cmd_connect_locked(profile: str, ovpn: Path) -> int:
                 proto,
                 sid,
                 username,
-                saml_response,
+                saml_response_for_openvpn,
                 "credentials-file",
             )
         except AuthRejectedError as e:
