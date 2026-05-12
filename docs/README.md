@@ -2,7 +2,7 @@
 
 awsvpnctl은 macOS에서 AWS Client VPN(SAML SSO)을 안정적으로 연결하고 자동 재연결하기 위한 로컬 도구예요.
 
-공식 AWS VPN Client.app을 계속 띄워두는 대신, AWS Client VPN의 SAML 인증 흐름을 OpenVPN으로 처리하고 LaunchAgent 데몬이 상태를 감시해요. AWS SSO로 로그인하면 자동 연결할 프로필을 붙이고, VPN이 끊기면 다시 연결해요.
+공식 AWS VPN Client.app에 의존하지 않고, AWS Client VPN의 SAML 인증 흐름을 `openvpn-aws`로 처리해요. LaunchAgent 데몬이 상태를 감시하고, AWS SSO로 로그인하면 자동 연결할 프로필을 붙이고, VPN이 끊기면 다시 연결해요.
 
 Hammerspoon은 선택 메뉴바 통합이에요. 메뉴바는 `awsvpnctl status --json`과 같은 상태 정보를 읽어서 실제 OpenVPN process와 `utun` 연결 상태를 보여주고, 수동 connect/disconnect 액션도 제공해요.
 
@@ -36,6 +36,7 @@ awsvpnctl status
 - Homebrew
 - AWS Client VPN `.ovpn` profile
 - AWS SSO browser session
+- AWS VPN Client.app 불필요
 - 선택 사항: Hammerspoon
 
 ## Key Concepts

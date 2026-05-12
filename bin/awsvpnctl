@@ -78,12 +78,14 @@ def _default_homebrew_prefix() -> Path:
     return Path("/opt/homebrew")
 
 
-AWS_CLIENT_OPENVPN_BIN = Path(
-    "/Applications/AWS VPN Client/AWS VPN Client.app/Contents/Resources/openvpn/acvc-openvpn"
-)
 HOMEBREW_PREFIX = _default_homebrew_prefix()
 HOMEBREW_OPENVPN_BIN = HOMEBREW_PREFIX / "opt/openvpn-aws/sbin/openvpn"
-DEFAULT_OPENVPN_BIN = AWS_CLIENT_OPENVPN_BIN if AWS_CLIENT_OPENVPN_BIN.exists() else HOMEBREW_OPENVPN_BIN
+INTEL_HOMEBREW_OPENVPN_BIN = Path("/usr/local/opt/openvpn-aws/sbin/openvpn")
+DEFAULT_OPENVPN_BIN = (
+    INTEL_HOMEBREW_OPENVPN_BIN
+    if not HOMEBREW_OPENVPN_BIN.exists() and INTEL_HOMEBREW_OPENVPN_BIN.exists()
+    else HOMEBREW_OPENVPN_BIN
+)
 OPENVPN_BIN = os.environ.get("OPENVPN_BIN", str(DEFAULT_OPENVPN_BIN))
 SAML_LISTEN_PORT = 35001
 SAML_TIMEOUT_SEC = 180
@@ -311,201 +313,6 @@ def is_connected(profile: str) -> bool:
     if not iface:
         return False
     return iface_up(iface)
-
-
-def external_aws_client_pid(profile: str) -> int | None:
-    """Return AWS VPN Client's own openvpn pid for this profile, if running."""
-    try:
-        out = subprocess.check_output(["/bin/ps", "-axo", "pid=,command="], text=True)
-    except subprocess.CalledProcessError:
-        return None
-    markers = []
-    for name in _external_aws_client_names(profile):
-        markers.extend([
-            f"--setenv CVPN_CONN_PROFILE_NAME {name}",
-            f"/OpenVpnConfigs/{name}",
-            f"ovpn-mgmt-{name}",
-        ])
-    for line in out.splitlines():
-        if "AWS VPN Client.app/Contents/Resources/openvpn" not in line:
-            continue
-        if any(marker in line for marker in markers):
-            try:
-                return int(line.strip().split(None, 1)[0])
-            except (ValueError, IndexError):
-                return None
-    return None
-
-
-def external_aws_client_status(profile: str) -> dict | None:
-    """Return official AWS VPN Client process/connection state for profile.
-
-    A running AWS VPN Client openvpn process is not enough to call the VPN
-    connected: the app can leave openvpn alive while it is waiting/retrying.
-    Treat it as connected only when its latest management state is CONNECTED
-    and the pushed VPN IP is still assigned to a live utun interface.
-    """
-    pid = external_aws_client_pid(profile)
-    if not pid:
-        return None
-
-    status = {
-        "pid": pid,
-        "connected": False,
-        "iface": None,
-        "endpoint": None,
-        "connected_at": None,
-    }
-    state = _external_aws_client_latest_state(profile, pid)
-    if not state or state.get("state") != "CONNECTED":
-        return status
-
-    iface = _iface_for_ip(state.get("vpn_ip") or "")
-    if not iface or not iface_up(iface):
-        return status
-
-    status.update({
-        "connected": True,
-        "iface": iface,
-        "endpoint": state.get("endpoint"),
-        "connected_at": state.get("connected_at"),
-    })
-    return status
-
-
-def stop_external_aws_client(profile: str, status: dict) -> None:
-    """Stop the official AWS VPN Client openvpn process for this profile."""
-    pid = status["pid"]
-    state = "connected" if status.get("connected") else "running"
-    if not SUDO_RUNNER.exists():
-        raise SystemExit(
-            f"sudo runner not found at {SUDO_RUNNER}; "
-            "cannot stop AWS VPN Client openvpn"
-        )
-
-    warn(
-        f"[{profile}] AWS VPN Client openvpn is {state} (pid={pid}); "
-        "disconnecting before awsvpnctl reconnect"
-    )
-    stop_profile_process(profile, pid)
-
-    deadline = time.time() + 5
-    while time.time() < deadline:
-        current = external_aws_client_pid(profile)
-        if not current:
-            return
-        if current != pid:
-            warn(
-                f"[{profile}] AWS VPN Client restarted openvpn "
-                f"(pid={current}); stopping it"
-            )
-            stop_profile_process(profile, current)
-            pid = current
-        time.sleep(0.25)
-
-    current = external_aws_client_pid(profile)
-    if current:
-        raise SystemExit(
-            f"[{profile}] AWS VPN Client openvpn is still running "
-            f"(pid={current}). Quit AWS VPN Client and retry."
-        )
-
-
-def _external_aws_client_latest_state(profile: str, pid: int) -> dict | None:
-    log_dir = Path.home() / ".config" / "AWSVPNClient" / "logs"
-    if not log_dir.exists():
-        return None
-    names = _external_aws_client_names(profile)
-    latest = None
-    logs = sorted(
-        log_dir.glob("ovpn_aws_vpn_client_*.log"),
-        key=lambda p: p.stat().st_mtime,
-    )[-5:]
-    for log in logs:
-        text = _tail_bytes(log, 1_000_000)
-        for line in text.splitlines():
-            if f":{pid}]" not in line or ">STATE:" not in line:
-                continue
-            if not any(f"[{name}:{pid}]" in line for name in names):
-                continue
-            fields = line.rsplit(">STATE:", 1)[1].split(",")
-            if len(fields) < 2:
-                continue
-            try:
-                connected_at = int(fields[0])
-            except ValueError:
-                connected_at = None
-            state = fields[1]
-            latest = {
-                "state": state,
-                "connected_at": connected_at if state == "CONNECTED" else None,
-                "vpn_ip": fields[3] if state == "CONNECTED" and len(fields) > 3 else None,
-                "endpoint": (
-                    f"{fields[4]}:{fields[5]}/udp"
-                    if state == "CONNECTED" and len(fields) > 5 and fields[4] and fields[5]
-                    else None
-                ),
-            }
-    return latest
-
-
-def _tail_bytes(p: Path, limit: int) -> str:
-    try:
-        with p.open("rb") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            f.seek(max(0, size - limit))
-            return f.read().decode("utf-8", "replace")
-    except OSError:
-        return ""
-
-
-def _iface_for_ip(ip: str) -> str | None:
-    if not ip:
-        return None
-    try:
-        out = subprocess.check_output(["/sbin/ifconfig"], text=True)
-    except subprocess.CalledProcessError:
-        return None
-    cur = None
-    for line in out.splitlines():
-        m = re.match(r"^(utun\d+):", line)
-        if m:
-            cur = m.group(1)
-            continue
-        if line and not line[0].isspace():
-            cur = None
-            continue
-        if cur and re.search(rf"\binet\s+{re.escape(ip)}\b", line):
-            return cur
-    return None
-
-
-def _external_aws_client_names(profile: str) -> set[str]:
-    """Return AWS VPN Client profile names that represent our profile.
-
-    The local awsvpnctl profile can be named differently from the official app
-    profile (e.g. awsvpnctl `prod` vs AWS VPN Client `prd`), so match by CVPN
-    endpoint id when the official client config is present.
-    """
-    names = {profile}
-    try:
-        host, _port, _proto = parse_endpoint(profile_path(profile))
-    except SystemExit:
-        return names
-    m = re.search(r"(cvpn-endpoint-[a-z0-9]+)", host)
-    if not m:
-        return names
-    endpoint_id = m.group(1)
-    path = Path.home() / ".config" / "AWSVPNClient" / "ConnectionProfiles"
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError):
-        return names
-    for row in data.get("ConnectionProfiles", []):
-        if row.get("CvpnEndpointId") == endpoint_id and row.get("ProfileName"):
-            names.add(str(row["ProfileName"]))
-    return names
 
 
 def iface_up(iface: str) -> bool:
@@ -2045,9 +1852,6 @@ def cmd_connect(args) -> int:
     if is_connected(profile):
         print(f"[{profile}] already connected")
         return 0
-    ext = external_aws_client_status(profile)
-    if ext:
-        stop_external_aws_client(profile, ext)
 
     # Clean up an orphan openvpn process that lost its tunnel (e.g. SAML expiry
     # mid-session left the process alive but the utun gone). Otherwise we'd spawn
@@ -2157,14 +1961,6 @@ def cmd_remove(args) -> int:
     profile = canonical_profile(args.profile)
     ovpn = profile_path(profile)
 
-    ext = external_aws_client_status(profile)
-    if ext:
-        state = "connected" if ext["connected"] else "running"
-        warn(
-            f"[remove] {profile}: AWS VPN Client process is {state} "
-            f"(pid={ext['pid']}); disconnect it in AWS VPN Client if needed"
-        )
-
     pid = read_pid(profile)
     if pid and pid_alive(pid):
         info(f"[remove] disconnecting {profile} pid={pid}")
@@ -2200,19 +1996,6 @@ def _gather_status() -> list[dict]:
         connected_at = read_state(profile, "connected_at")
         endpoint = read_state(profile, "endpoint")
         connected = is_connected(profile)
-        source = "awsvpnctl"
-        external_pid = None
-        if not connected:
-            ext = external_aws_client_status(profile)
-            if ext:
-                external_pid = ext["pid"]
-            if ext and ext["connected"]:
-                connected = True
-                pid = ext["pid"]
-                iface = ext["iface"]
-                endpoint = ext["endpoint"]
-                connected_at = ext["connected_at"]
-                source = "AWS VPN Client"
         out.append({
             "profile": profile,
             "connected": connected,
@@ -2220,8 +2003,7 @@ def _gather_status() -> list[dict]:
             "iface": iface if connected else None,
             "endpoint": endpoint,
             "connected_at": int(connected_at) if connected_at and connected else None,
-            "source": source if connected else None,
-            "external_pid": external_pid,
+            "source": "awsvpnctl" if connected else None,
         })
     return out
 
@@ -2253,13 +2035,8 @@ def _print_status(as_json: bool) -> int:
         flag = "● connected" if r["connected"] else "○ down"
         extra = ""
         if r["connected"]:
-            if r.get("source") == "AWS VPN Client":
-                extra = f"  by=AWS VPN Client  pid={r['pid']}  iface={r['iface']}"
-            else:
-                secs = int(time.time()) - (r["connected_at"] or 0)
-                extra = f"  iface={r['iface']}  up={_fmt_dur(secs)}"
-        elif r.get("external_pid"):
-            extra = f"  AWS VPN Client pid={r['external_pid']} running"
+            secs = int(time.time()) - (r["connected_at"] or 0)
+            extra = f"  iface={r['iface']}  up={_fmt_dur(secs)}"
         print(f"  {r['profile']:<{width}}  {flag}{extra}")
     return 0
 
@@ -2538,23 +2315,12 @@ def cmd_doctor(args) -> int:
         all_ok = True
         for r in rows:
             if r["connected"]:
-                if r.get("source") == "AWS VPN Client":
-                    lines.append(
-                        f"{r['profile']}: connected by AWS VPN Client "
-                        f"(pid={r['pid']}, {r['iface']})"
-                    )
-                else:
-                    up = int(time.time()) - (r["connected_at"] or 0)
-                    lines.append(f"{r['profile']}: connected ({r['iface']}, up {_fmt_dur(up)})")
+                up = int(time.time()) - (r["connected_at"] or 0)
+                lines.append(f"{r['profile']}: connected ({r['iface']}, up {_fmt_dur(up)})")
             else:
                 if r["profile"] in auto:
                     all_ok = False
-                if r.get("external_pid"):
-                    lines.append(
-                        f"{r['profile']}: down "
-                        f"(AWS VPN Client pid={r['external_pid']} running)"
-                    )
-                elif r["profile"] not in auto:
+                if r["profile"] not in auto:
                     lines.append(f"{r['profile']}: down (manual)")
                 else:
                     lines.append(f"{r['profile']}: down")
@@ -2677,7 +2443,7 @@ def cmd_daemon(args) -> int:
             sso_ok = _sso_token_valid()
 
             for profile in _auto_profiles():
-                if is_connected(profile) or external_aws_client_pid(profile):
+                if is_connected(profile):
                     continue
                 # User explicitly disconnected — don't fight them.
                 if state_path(profile, "disabled").exists() and not sso_refreshed:

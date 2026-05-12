@@ -2,7 +2,7 @@
 
 macOS에서 AWS Client VPN(SAML SSO)을 CLI, LaunchAgent, Hammerspoon 메뉴바로 제어하는 도구예요.
 
-공식 AWS VPN Client.app을 계속 띄워두는 대신 OpenVPN을 직접 실행하고, LaunchAgent 데몬이 AWS SSO 로그인과 VPN 상태를 보고 자동으로 연결해요. 화면 잠금이나 유휴 상태에서도 연결 유지가 더 예측 가능하도록 구성해요.
+공식 AWS VPN Client.app에 의존하지 않고 `openvpn-aws`를 직접 실행해요. LaunchAgent 데몬이 AWS SSO 로그인과 VPN 상태를 보고 자동으로 연결해요. 화면 잠금이나 유휴 상태에서도 연결 유지가 더 예측 가능하도록 구성해요.
 
 Hammerspoon을 쓰면 선택 메뉴바 통합도 붙일 수 있어요. 메뉴바는 `awsvpnctl status --json`과 같은 상태 정보를 읽어서 실제 연결 상태와 connect/disconnect 액션을 보여줘요.
 
@@ -22,7 +22,7 @@ awsvpnctl status
 
 `<name>`은 `~/.aws/config`의 `[sso-session ...]` 블록 이름이에요. `<profile_name>`은 `setup`에서 가져온 `.ovpn` 파일 이름을 기준으로 정해요. 예를 들어 `dev.ovpn`으로 가져오면 `awsvpnctl connect dev`를 써요.
 
-`awsvpnctl setup`은 필요한 OpenVPN, 제한된 sudoers, LaunchAgent를 설치한 뒤 `~/Downloads`와 `~/Desktop`에서 AWS Client VPN export로 보이는 `.ovpn` 파일을 찾아 `etc/profiles/`로 가져와요. 자동 연결할 프로필도 이때 설정해요.
+`awsvpnctl setup`은 필요한 OpenVPN, 제한된 sudoers, LaunchAgent를 설치한 뒤 `~/Downloads`와 `~/Desktop`에서 AWS Client VPN export로 보이는 `.ovpn` 파일을 찾아 `etc/profiles/`로 가져와요. AWS VPN Client.app 설치나 실행은 필요하지 않아요. 자동 연결할 프로필도 이때 설정해요.
 
 파일 후보만 확인하고 가져오지 않으려면 `awsvpnctl setup --skip-import`를 사용해요.
 
