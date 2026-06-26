@@ -60,6 +60,20 @@ awsvpnctl disconnect dev
 
 다음 SSO refresh 또는 수동 connect가 있으면 sentinel이 해제돼요.
 
+## Stop Auto Reconnect
+
+```bash
+awsvpnctl exit
+```
+
+`exit`은 LaunchAgent 데몬을 내리고 자동 재연결을 pause해요. 데몬이 interval마다 profile connect를 다시 시도하지 않게 하며, 현재 연결된 VPN은 유지해요.
+
+자동 재연결을 다시 켜려면:
+
+```bash
+awsvpnctl daemon restart
+```
+
 ## Check Daemon
 
 ```bash

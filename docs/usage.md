@@ -65,6 +65,20 @@ awsvpnctl disconnect dev
 - `awsvpnctl connect <profile>`
 - 새 `aws sso login`
 
+## Exit Daemon
+
+```bash
+awsvpnctl exit
+```
+
+`exit`은 LaunchAgent 데몬을 내리고 `var/run/.daemon-paused` sentinel을 남겨 자동 재연결과 interval connect 재시도를 멈춰요. 현재 연결된 VPN profile은 끊지 않아요.
+
+다시 자동 재연결을 켜려면:
+
+```bash
+awsvpnctl daemon restart
+```
+
 ## Remove a Profile
 
 ```bash
