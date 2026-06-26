@@ -4,8 +4,8 @@
 class OpenvpnAws < Formula
   desc "OpenVPN with AWS Client VPN SAML federated auth (auth-federate)"
   homepage "https://github.com/samm-git/aws-vpn-client"
-  url "https://github.com/OpenVPN/openvpn/archive/refs/tags/v2.6.12.tar.gz"
-  sha256 "cbca5e13b2b1c4de5ef0361d37c44b5e97e8654948f80d95ca249b474108d4c0"
+  url "https://swupdate.openvpn.org/community/releases/openvpn-2.6.12.tar.gz"
+  sha256 "1c610fddeb686e34f1367c347e027e418e07523a10f4d8ce4a2c2af2f61a1929"
   version "2.6.12-aws"
   revision 1
   license "GPL-2.0-only" => { with: "openvpn-openssl-exception" }
@@ -15,10 +15,7 @@ class OpenvpnAws < Formula
     sha256 "561f0887a7043452cff55f3140539f18c7a63e914343047c98f82a121f356457"
   end
 
-  depends_on "autoconf"      => :build
-  depends_on "automake"      => :build
-  depends_on "docutils"      => :build  # provides rst2man for man pages (GitHub source archive lacks prebuilt ones)
-  depends_on "libtool"       => :build
+  depends_on "docutils"      => :build  # provides rst2man for man pages
   depends_on "pkg-config"    => :build
   depends_on "lz4"
   depends_on "lzo"
@@ -34,8 +31,6 @@ class OpenvpnAws < Formula
       s.gsub! "#define USER_PASS_LEN 1 << 17", "#define USER_PASS_LEN (1 << 17)"
     end
 
-    # GitHub source archive lacks a configure script; bootstrap autotools.
-    system "autoreconf", "-i", "-v", "-f"
     system "./configure",
       "--disable-debug",
       "--disable-dependency-tracking",
