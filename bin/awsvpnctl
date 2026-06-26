@@ -13,6 +13,7 @@ Subcommands:
   doctor                 diagnose installation health
   uninstall              remove runtime integrations (keeps profiles/logs)
   daemon                 background watcher (auto-reconnect, SSO-trigger)
+  exit                   stop the daemon and pause automatic reconnect
 
 State files live under <project>/var/run/<profile>.*
 Logs under <project>/log/<profile>.log
@@ -91,6 +92,7 @@ SAML_LISTEN_PORT = 35001
 SAML_TIMEOUT_SEC = 180
 CONNECT_TIMEOUT_SEC = 45
 SLEEP_GUARD_PID_FILE = VAR_RUN / "sleep-guard.pid"
+DAEMON_PAUSE_FILE = VAR_RUN / ".daemon-paused"
 
 VAR_RUN.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -1109,6 +1111,18 @@ def _run_launchctl(args: list[str], *, check: bool = True) -> subprocess.Complet
     return proc
 
 
+def _daemon_paused() -> bool:
+    return DAEMON_PAUSE_FILE.exists()
+
+
+def _pause_daemon() -> None:
+    DAEMON_PAUSE_FILE.write_text(f"paused_at={int(time.time())}\n")
+
+
+def _resume_daemon() -> None:
+    DAEMON_PAUSE_FILE.unlink(missing_ok=True)
+
+
 def _check_hammerspoon_app() -> bool:
     return Path("/Applications/Hammerspoon.app").is_dir()
 
@@ -1285,6 +1299,7 @@ def _install_sudoers() -> None:
 
 def _install_launchagent() -> None:
     print("\n[launchd] Installing auto-reconnect daemon")
+    _resume_daemon()
     LAUNCH_AGENT_DIR.mkdir(parents=True, exist_ok=True)
     template = PROJECT_ROOT / "share" / "com.awsvpnctl.daemon.plist"
     rendered = (
@@ -1862,7 +1877,7 @@ def cmd_setup(args) -> int:
 
 
 # ---------------------------------------------------------------------------
-# command: connect / disconnect / status / list / logs / daemon
+# command: connect / disconnect / status / list / logs / daemon / exit
 # ---------------------------------------------------------------------------
 
 def cmd_connect(args) -> int:
@@ -2258,6 +2273,8 @@ def cmd_doctor(args) -> int:
 
     def chk_launchagent():
         label = "com.awsvpnctl.daemon"
+        if _daemon_paused():
+            return ("warn", "auto-reconnect paused by `awsvpnctl exit`")
         proc = subprocess.run(
             ["/bin/launchctl", "print", f"gui/{os.getuid()}/{label}"],
             capture_output=True, text=True,
@@ -2449,9 +2466,93 @@ def _safe_connect(profile: str) -> None:
         warn(f"[daemon] connect {profile} crashed: {e!r}")
 
 
+def _daemon_process_pids() -> list[int]:
+    try:
+        out = subprocess.check_output(
+            ["/bin/ps", "-axo", "pid=,command="],
+            text=True,
+        )
+    except Exception:  # noqa: BLE001
+        return []
+
+    pids: list[int] = []
+    roots = {str(PROJECT_ROOT), str(AWSVPNCTL_BIN)}
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            pid_s, command = line.split(None, 1)
+            pid = int(pid_s)
+        except ValueError:
+            continue
+        if pid == os.getpid():
+            continue
+        if "awsvpnctl" not in command or not re.search(r"(^|\s)daemon(\s|$)", command):
+            continue
+        if not any(root in command for root in roots):
+            continue
+        pids.append(pid)
+    return sorted(set(pids))
+
+
+def _stop_daemon_processes() -> list[int]:
+    pids = _daemon_process_pids()
+    for pid in pids:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGTERM)
+
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        alive = [pid for pid in pids if pid_alive(pid)]
+        if not alive:
+            return pids
+        time.sleep(0.1)
+
+    for pid in pids:
+        if pid_alive(pid):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+    return pids
+
+
+def cmd_exit(_args) -> int:
+    _pause_daemon()
+
+    booted_out = False
+    if _check_macos() and LAUNCH_AGENT_TARGET.exists():
+        proc = _run_launchctl(
+            ["bootout", _launchctl_domain(), str(LAUNCH_AGENT_TARGET)],
+            check=False,
+        )
+        booted_out = proc.returncode == 0
+        if proc.returncode != 0:
+            msg = (proc.stderr or proc.stdout or "").strip()
+            if msg:
+                warn(f"[exit] launchd bootout skipped: {msg}")
+
+    pids = _stop_daemon_processes()
+    _stop_sleep_guard()
+
+    if booted_out:
+        print(f"[daemon] unloaded {LAUNCH_AGENT_LABEL}")
+    if pids:
+        print(f"[daemon] stopped process(es): {', '.join(str(pid) for pid in pids)}")
+    if not booted_out and not pids:
+        print("[daemon] no running daemon found")
+    print("[daemon] automatic reconnect paused")
+    print("[daemon] run `awsvpnctl daemon restart` or `awsvpnctl setup` to resume")
+    return 0
+
+
 def cmd_daemon(args) -> int:
     if getattr(args, "action", None) == "restart":
         return cmd_daemon_restart(args)
+
+    if _daemon_paused():
+        info("[daemon] paused by awsvpnctl exit; exiting")
+        _stop_sleep_guard()
+        return 0
 
     info("[daemon] started")
     last_sso_mtime = _sso_latest_mtime()
@@ -2466,6 +2567,11 @@ def cmd_daemon(args) -> int:
 
     while True:
         try:
+            if _daemon_paused():
+                info("[daemon] paused by awsvpnctl exit; exiting")
+                _stop_sleep_guard()
+                return 0
+
             cur_mtime = _sso_latest_mtime()
             sso_refreshed = cur_mtime > last_sso_mtime
             if sso_refreshed:
@@ -2503,6 +2609,7 @@ def cmd_daemon_restart(_args) -> int:
     if not LAUNCH_AGENT_TARGET.exists():
         raise SystemExit(f"LaunchAgent plist not found: {LAUNCH_AGENT_TARGET}. Run `awsvpnctl setup` first.")
 
+    _resume_daemon()
     domain = _launchctl_domain()
     bootout = _run_launchctl(["bootout", domain, str(LAUNCH_AGENT_TARGET)], check=False)
     if bootout.returncode != 0:
@@ -2579,6 +2686,9 @@ def main(argv=None) -> int:
                    help="daemon action; omit to run the watcher loop")
     p.add_argument("--interval", type=float, default=15.0)
     p.set_defaults(func=cmd_daemon)
+
+    p = sub.add_parser("exit", help="stop daemon and pause automatic reconnect")
+    p.set_defaults(func=cmd_exit)
 
     p = sub.add_parser("doctor", help="diagnose installation health")
     p.set_defaults(func=cmd_doctor)

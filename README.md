@@ -35,6 +35,7 @@ awsvpnctl status
 awsvpnctl disconnect <profile_name>
 awsvpnctl remove <profile_name>
 awsvpnctl logs <profile_name> -f
+awsvpnctl exit
 ```
 
 자동 연결은 AWS SSO 로그인 후 동작해요.
@@ -42,6 +43,8 @@ awsvpnctl logs <profile_name> -f
 ```bash
 aws sso login --sso-session <name>
 ```
+
+자동 재연결 데몬을 멈추고 interval 재시도를 막으려면 `awsvpnctl exit`을 사용해요. 다시 켜려면 `awsvpnctl daemon restart`를 실행해요.
 
 사용 가능한 SSO session 이름은 아래처럼 확인해요.
 
